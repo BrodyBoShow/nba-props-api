@@ -3,8 +3,10 @@ from flask_cors import CORS
 from nba_api.stats.endpoints import (
     leaguedashplayerstats,
     leaguedashteamstats,
+    playergamelog,
 )
 from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
+import pandas as pd
 import time
 import logging
 
@@ -189,6 +191,89 @@ def get_schedule():
 
     except Exception as e:
         logging.error("Error fetching schedule: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+def _parse_min(val):
+    try:
+        if isinstance(val, str) and ":" in val:
+            parts = val.split(":")
+            return round(int(parts[0]) + int(parts[1]) / 60, 1)
+        return _f(val)
+    except (ValueError, IndexError):
+        return 0.0
+
+
+def _game_log_avg(df):
+    def safe_pct(col):
+        val = df[col].mean()
+        return round(float(val) * 100, 1) if not pd.isna(val) else 0.0
+
+    return {
+        "ppg": _f(df["PTS"].mean()),
+        "rpg": _f(df["REB"].mean()),
+        "apg": _f(df["AST"].mean()),
+        "spg": _f(df["STL"].mean()),
+        "bpg": _f(df["BLK"].mean()),
+        "topg": _f(df["TOV"].mean()),
+        "fg": safe_pct("FG_PCT"),
+        "fg3": safe_pct("FG3_PCT"),
+        "ft": safe_pct("FT_PCT"),
+        "min": _f(df["MIN"].apply(_parse_min).mean()),
+        "gp": len(df),
+    }
+
+
+@app.route("/api/recent/<int:player_id>")
+def get_recent(player_id):
+    try:
+        logs = playergamelog.PlayerGameLog(
+            player_id=player_id,
+            season=SEASON,
+            season_type_all_star="Playoffs",
+        ).get_data_frames()[0]
+
+        if logs.empty:
+            return jsonify({"success": True, "recent": None, "gp": 0})
+
+        recent = logs.head(5)
+        return jsonify({"success": True, "recent": _game_log_avg(recent), "gp": len(recent)})
+
+    except Exception as e:
+        logging.error("Error fetching recent stats: %s", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/vs-opponent/<int:player_id>/<opp_abbr>")
+def get_vs_opponent(player_id, opp_abbr):
+    try:
+        po_logs = playergamelog.PlayerGameLog(
+            player_id=player_id,
+            season=SEASON,
+            season_type_all_star="Playoffs",
+        ).get_data_frames()[0]
+        _sleep()
+
+        vs = po_logs[po_logs["MATCHUP"].str.contains(opp_abbr, na=False, case=False)]
+        source = "Playoffs"
+
+        if len(vs) < 2:
+            rs_logs = playergamelog.PlayerGameLog(
+                player_id=player_id,
+                season=SEASON,
+                season_type_all_star="Regular Season",
+            ).get_data_frames()[0]
+            rs_vs = rs_logs[rs_logs["MATCHUP"].str.contains(opp_abbr, na=False, case=False)]
+            vs = pd.concat([vs, rs_vs])
+            source = "PO+RS" if not po_logs.empty else "RS"
+
+        if vs.empty:
+            return jsonify({"success": True, "vsOpponent": None, "gp": 0, "source": None})
+
+        return jsonify({"success": True, "vsOpponent": _game_log_avg(vs), "gp": len(vs), "source": source})
+
+    except Exception as e:
+        logging.error("Error fetching vs-opponent stats: %s", e)
         return jsonify({"success": False, "error": str(e)}), 500
 
 
