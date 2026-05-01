@@ -4,6 +4,8 @@ from nba_api.stats.endpoints import (
     leaguedashplayerstats,
     leaguedashteamstats,
     leaguedashptteamdefend,
+    leaguedashplayerclutch,
+    leaguehustlestatsplayer,
     playergamelog,
 )
 from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
@@ -67,7 +69,6 @@ def _i(val):
 
 
 def _stat_row(r):
-    """Convert a row dict (from nba_api DataFrame) to a standardised stat object."""
     if not r:
         return None
     return {
@@ -181,10 +182,6 @@ def _build_teams():
 
 
 def _build_splits():
-    """
-    Per-player home/road PO splits via location_nullable parameter.
-    Returns {player_name: {pid, home: statRow, road: statRow}}.
-    """
     logging.info("Fetching PO home splits...")
     home_df = _fetch_player_stats("Playoffs", location="Home")
     _sleep()
@@ -194,7 +191,6 @@ def _build_splits():
     home_idx = home_df.set_index("PLAYER_ID").to_dict("index")
     road_idx = road_df.set_index("PLAYER_ID").to_dict("index")
 
-    # Collect all player names + pids from both DataFrames
     all_players: dict = {}
     for df in (home_df, road_df):
         for _, row in df.iterrows():
@@ -216,26 +212,17 @@ def _build_splits():
 
 
 def _build_team_defense():
-    """
-    Per-team opponent shooting %, by zone, in Playoffs.
-    PCT_PLUSMINUS = opp_FG% - league_avg_FG% in that zone (decimal, e.g. -0.030).
-    Negative = team defends this zone well; positive = team gives up more than avg.
-    """
     logging.info("Fetching PO 3pt team defense...")
     fg3_df = leaguedashptteamdefend.LeagueDashPtTeamDefend(
-        season=SEASON,
-        season_type_all_star="Playoffs",
-        defense_category="3 Pointers",
-        per_mode_simple="PerGame",
+        season=SEASON, season_type_all_star="Playoffs",
+        defense_category="3 Pointers", per_mode_simple="PerGame",
     ).get_data_frames()[0]
     _sleep()
 
-    logging.info("Fetching PO 2pt (<6ft rim) team defense...")
+    logging.info("Fetching PO rim (<6ft) team defense...")
     rim_df = leaguedashptteamdefend.LeagueDashPtTeamDefend(
-        season=SEASON,
-        season_type_all_star="Playoffs",
-        defense_category="Less Than 6Ft",
-        per_mode_simple="PerGame",
+        season=SEASON, season_type_all_star="Playoffs",
+        defense_category="Less Than 6Ft", per_mode_simple="PerGame",
     ).get_data_frames()[0]
 
     fg3_idx = fg3_df.set_index("TEAM_ABBREVIATION").to_dict("index")
@@ -247,104 +234,191 @@ def _build_team_defense():
         fg3 = fg3_idx.get(abbr, {})
         rim = rim_idx.get(abbr, {})
         team_def[abbr] = {
-            # How much better/worse opponents shoot on 3s vs league avg (decimal)
-            "fg3VsAvg": _f(fg3.get("PCT_PLUSMINUS", 0), 4),
+            "fg3VsAvg":  _f(fg3.get("PCT_PLUSMINUS", 0), 4),
             "fg3OppPct": _f(fg3.get("D_FG_PCT", 0), 4),
-            # Same for rim (< 6ft)
-            "rimVsAvg": _f(rim.get("PCT_PLUSMINUS", 0), 4),
+            "rimVsAvg":  _f(rim.get("PCT_PLUSMINUS", 0), 4),
             "rimOppPct": _f(rim.get("D_FG_PCT", 0), 4),
         }
     logging.info("Built team defense for %d teams", len(team_def))
     return team_def
 
 
-# ── Background warm-up on startup ─────────────────────────────────────────────
+def _build_scoring():
+    """
+    Shot profile breakdown per player (Playoffs).
+    Key cols: PCT_PTS_3PT, PCT_PTS_PAINT, PCT_FGA_3PT, PCT_PTS_FT, PCT_PTS_2PT_MR
+    Used to weight zone-specific defense by how a player actually scores.
+    """
+    logging.info("Fetching PO scoring breakdown...")
+    df = _fetch_player_stats("Playoffs", "Scoring")
+
+    scoring = {}
+    for _, row in df.iterrows():
+        name = row["PLAYER_NAME"].lower()
+        scoring[name] = {
+            "pid":        int(row["PLAYER_ID"]),
+            "pctPts3pt":  _f(row.get("PCT_PTS_3PT", 0) or 0, 1) * 100,   # % of PTS from 3s
+            "pctPtsPaint":_f(row.get("PCT_PTS_PAINT", 0) or 0, 1) * 100,  # % from paint
+            "pctPtsFt":   _f(row.get("PCT_PTS_FT", 0) or 0, 1) * 100,    # % from FTs
+            "pctPtsMr":   _f(row.get("PCT_PTS_2PT_MR", 0) or 0, 1) * 100,# % midrange
+            "pctFga3pt":  _f(row.get("PCT_FGA_3PT", 0) or 0, 1) * 100,   # % of shots = 3s
+            "efgPct":     _pct(row.get("EFG_PCT")),
+        }
+
+    logging.info("Built scoring breakdown for %d players", len(scoring))
+    return scoring
+
+
+def _build_clutch():
+    """
+    Clutch performance per player (Playoffs, last 5 min within 5 pts).
+    Used to adjust scoring projections for players who elevate/disappear in close games.
+    """
+    logging.info("Fetching PO clutch stats...")
+    df = leaguedashplayerclutch.LeagueDashPlayerClutch(
+        season=SEASON,
+        season_type_all_star="Playoffs",
+        per_mode_simple="PerGame",
+    ).get_data_frames()[0]
+
+    clutch = {}
+    for _, row in df.iterrows():
+        name = row["PLAYER_NAME"].lower()
+        clutch[name] = {
+            "pid": int(row["PLAYER_ID"]),
+            "gp":  _i(row.get("GP", 0)),
+            "min": _f(row.get("MIN", 0)),
+            "ppg": _f(row.get("PTS", 0)),
+            "rpg": _f(row.get("REB", 0)),
+            "apg": _f(row.get("AST", 0)),
+            "fg":  _pct(row.get("FG_PCT")),
+            "fg3": _pct(row.get("FG3_PCT")),
+            "ft":  _pct(row.get("FT_PCT")),
+            "pm":  _f(row.get("PLUS_MINUS", 0)),
+        }
+
+    logging.info("Built clutch stats for %d players", len(clutch))
+    return clutch
+
+
+def _build_hustle():
+    """
+    Hustle stats per player (Playoffs): contested shots, deflections, box-outs.
+    Used for rebounds/steals prop context and adjustments.
+    """
+    logging.info("Fetching PO hustle stats...")
+    df = leaguehustlestatsplayer.LeagueHustleStatsPlayer(
+        season=SEASON,
+        season_type_all_star="Playoffs",
+        per_mode_time="PerGame",
+    ).get_data_frames()[0]
+
+    hustle = {}
+    for _, row in df.iterrows():
+        name = row["PLAYER_NAME"].lower()
+        hustle[name] = {
+            "pid":            int(row["PLAYER_ID"]),
+            "gp":             _i(row.get("G", 0)),
+            "min":            _f(row.get("MIN", 0)),
+            "contestedShots": _f(row.get("CONTESTED_SHOTS", 0)),
+            "contested2pt":   _f(row.get("CONTESTED_SHOTS_2PT", 0)),
+            "contested3pt":   _f(row.get("CONTESTED_SHOTS_3PT", 0)),
+            "deflections":    _f(row.get("DEFLECTIONS", 0)),
+            "chargesDrawn":   _f(row.get("CHARGES_DRAWN", 0)),
+            "screenAssists":  _f(row.get("SCREEN_ASSISTS", 0)),
+            "defBoxouts":     _f(row.get("DEF_BOXOUTS", 0)),
+            "offBoxouts":     _f(row.get("OFF_BOXOUTS", 0)),
+            "boxoutRebounds": _f(row.get("BOX_OUT_PLAYER_REBS", 0)),
+        }
+
+    logging.info("Built hustle stats for %d players", len(hustle))
+    return hustle
+
+
+# ── Background warm-up ────────────────────────────────────────────────────────
 def _warmup():
     logging.info("Background warm-up starting...")
-    try:
-        players = _build_players()
-        _cache_set("players", {"success": True, "players": players, "count": len(players)})
-        _sleep()
-        teams = _build_teams()
-        _cache_set("teams", {"success": True, "teams": teams})
-        _sleep()
-        splits = _build_splits()
-        _cache_set("splits", {"success": True, "splits": splits})
-        _sleep()
-        team_def = _build_team_defense()
-        _cache_set("team_defense", {"success": True, "teamDefense": team_def})
-        logging.info("Warm-up complete.")
-    except Exception as e:
-        logging.error("Warm-up failed: %s", e)
+    steps = [
+        ("players",     lambda: _build_players(),      "players",      lambda d: {"success": True, "players": d, "count": len(d)}),
+        ("teams",       lambda: _build_teams(),        "teams",        lambda d: {"success": True, "teams": d}),
+        ("splits",      lambda: _build_splits(),       "splits",       lambda d: {"success": True, "splits": d}),
+        ("team_defense",lambda: _build_team_defense(), "teamDefense",  lambda d: {"success": True, "teamDefense": d}),
+        ("scoring",     lambda: _build_scoring(),      "scoring",      lambda d: {"success": True, "scoring": d}),
+        ("clutch",      lambda: _build_clutch(),       "clutch",       lambda d: {"success": True, "clutch": d}),
+        ("hustle",      lambda: _build_hustle(),       "hustle",       lambda d: {"success": True, "hustle": d}),
+    ]
+    for cache_key, builder, _, wrapper in steps:
+        try:
+            data = builder()
+            _cache_set(cache_key, wrapper(data))
+            _sleep()
+        except Exception as e:
+            logging.error("Warm-up failed for %s: %s", cache_key, e)
+    logging.info("Warm-up complete.")
 
 
 threading.Thread(target=_warmup, daemon=True).start()
 
 
+# ── Helper: generic cached endpoint builder ───────────────────────────────────
+def _cached_endpoint(cache_key, builder, response_key):
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+    try:
+        data = builder()
+        result = {"success": True, response_key: data}
+        _cache_set(cache_key, result)
+        return result
+    except Exception as e:
+        logging.error("Error building %s: %s", cache_key, e)
+        return {"success": False, "error": str(e)}
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/api/players")
 def get_players():
-    cached = _cache_get("players")
-    if cached:
-        return jsonify(cached)
-    try:
-        players = _build_players()
-        result = {"success": True, "players": players, "count": len(players)}
-        _cache_set("players", result)
-        return jsonify(result)
-    except Exception as e:
-        logging.error("Error fetching players: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 500
+    r = _cached_endpoint("players", _build_players, "players")
+    return (r, 200) if r.get("success") else (r, 500)
 
 
 @app.route("/api/teams")
 def get_teams():
-    cached = _cache_get("teams")
-    if cached:
-        return jsonify(cached)
-    try:
-        teams = _build_teams()
-        result = {"success": True, "teams": teams}
-        _cache_set("teams", result)
-        return jsonify(result)
-    except Exception as e:
-        logging.error("Error fetching teams: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 500
+    r = _cached_endpoint("teams", _build_teams, "teams")
+    return (r, 200) if r.get("success") else (r, 500)
 
 
 @app.route("/api/splits")
 def get_splits():
-    """Home/road per-player playoff splits from NBA.com (location_nullable)."""
-    cached = _cache_get("splits")
-    if cached:
-        return jsonify(cached)
-    try:
-        splits = _build_splits()
-        result = {"success": True, "splits": splits}
-        _cache_set("splits", result)
-        return jsonify(result)
-    except Exception as e:
-        logging.error("Error fetching splits: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 500
+    r = _cached_endpoint("splits", _build_splits, "splits")
+    return (r, 200) if r.get("success") else (r, 500)
 
 
 @app.route("/api/team-defense")
 def get_team_defense():
-    """
-    Per-team zone defense (3pt + rim) from NBA.com LeagueDashPtTeamDefend.
-    PCT_PLUSMINUS = opp FG% minus league avg (decimal) — negative = good defense.
-    """
-    cached = _cache_get("team_defense")
-    if cached:
-        return jsonify(cached)
-    try:
-        team_def = _build_team_defense()
-        result = {"success": True, "teamDefense": team_def}
-        _cache_set("team_defense", result)
-        return jsonify(result)
-    except Exception as e:
-        logging.error("Error fetching team defense: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 500
+    r = _cached_endpoint("team_defense", _build_team_defense, "teamDefense")
+    return (r, 200) if r.get("success") else (r, 500)
+
+
+@app.route("/api/scoring")
+def get_scoring():
+    """PO shot profile: % pts from 3s, paint, FTs, midrange. Weights zone defense by player type."""
+    r = _cached_endpoint("scoring", _build_scoring, "scoring")
+    return (r, 200) if r.get("success") else (r, 500)
+
+
+@app.route("/api/clutch")
+def get_clutch():
+    """PO clutch stats (last 5 min, within 5 pts): PPG/RPG/APG/FG% in pressure situations."""
+    r = _cached_endpoint("clutch", _build_clutch, "clutch")
+    return (r, 200) if r.get("success") else (r, 500)
+
+
+@app.route("/api/hustle")
+def get_hustle():
+    """PO hustle stats: deflections, contested shots, box-outs per game."""
+    r = _cached_endpoint("hustle", _build_hustle, "hustle")
+    return (r, 200) if r.get("success") else (r, 500)
 
 
 @app.route("/api/schedule")
@@ -358,19 +432,16 @@ def get_schedule():
             home = g.get("homeTeam", {})
             games.append({
                 "id": g.get("gameId"),
-                "away": away.get("teamTricode"),
-                "home": home.get("teamTricode"),
-                "awayTeam": away.get("teamName"),
-                "homeTeam": home.get("teamName"),
+                "away": away.get("teamTricode"), "home": home.get("teamTricode"),
+                "awayTeam": away.get("teamName"), "homeTeam": home.get("teamName"),
                 "status": g.get("gameStatusText"),
-                "awayScore": away.get("score"),
-                "homeScore": home.get("score"),
+                "awayScore": away.get("score"), "homeScore": home.get("score"),
                 "period": g.get("period"),
             })
-        return jsonify({"success": True, "games": games})
+        return {"success": True, "games": games}
     except Exception as e:
         logging.error("Error fetching schedule: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 500
+        return {"success": False, "error": str(e)}, 500
 
 
 @app.route("/api/cache-status")
@@ -384,10 +455,10 @@ def cache_status():
                 "expires_in": round(_CACHE_TTL - age),
                 "valid": age < _CACHE_TTL,
             }
-    return jsonify(status)
+    return status
 
 
-# ── Game log endpoints (not cached — player-specific, called on demand) ───────
+# ── Game log endpoints (on-demand, not cached) ────────────────────────────────
 def _parse_min(val):
     try:
         if isinstance(val, str) and ":" in val:
@@ -402,16 +473,11 @@ def _game_log_avg(df):
     def safe_pct(col):
         val = df[col].mean()
         return round(float(val) * 100, 1) if not pd.isna(val) else 0.0
-
     return {
-        "ppg":  _f(df["PTS"].mean()),
-        "rpg":  _f(df["REB"].mean()),
-        "apg":  _f(df["AST"].mean()),
-        "spg":  _f(df["STL"].mean()),
-        "bpg":  _f(df["BLK"].mean()),
-        "topg": _f(df["TOV"].mean()),
-        "fg":   safe_pct("FG_PCT"),
-        "fg3":  safe_pct("FG3_PCT"),
+        "ppg":  _f(df["PTS"].mean()),  "rpg":  _f(df["REB"].mean()),
+        "apg":  _f(df["AST"].mean()),  "spg":  _f(df["STL"].mean()),
+        "bpg":  _f(df["BLK"].mean()),  "topg": _f(df["TOV"].mean()),
+        "fg":   safe_pct("FG_PCT"),    "fg3":  safe_pct("FG3_PCT"),
         "ft":   safe_pct("FT_PCT"),
         "min":  _f(df["MIN"].apply(_parse_min).mean()),
         "gp":   len(df),
@@ -422,24 +488,22 @@ def _game_log_avg(df):
 def get_recent(player_id):
     try:
         logs = playergamelog.PlayerGameLog(
-            player_id=player_id, season=SEASON,
-            season_type_all_star="Playoffs",
+            player_id=player_id, season=SEASON, season_type_all_star="Playoffs",
         ).get_data_frames()[0]
         if logs.empty:
-            return jsonify({"success": True, "recent": None, "gp": 0})
+            return {"success": True, "recent": None, "gp": 0}
         recent = logs.head(5)
-        return jsonify({"success": True, "recent": _game_log_avg(recent), "gp": len(recent)})
+        return {"success": True, "recent": _game_log_avg(recent), "gp": len(recent)}
     except Exception as e:
-        logging.error("Error fetching recent stats: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 500
+        logging.error("Error fetching recent: %s", e)
+        return {"success": False, "error": str(e)}, 500
 
 
 @app.route("/api/vs-opponent/<int:player_id>/<opp_abbr>")
 def get_vs_opponent(player_id, opp_abbr):
     try:
         po_logs = playergamelog.PlayerGameLog(
-            player_id=player_id, season=SEASON,
-            season_type_all_star="Playoffs",
+            player_id=player_id, season=SEASON, season_type_all_star="Playoffs",
         ).get_data_frames()[0]
         _sleep()
 
@@ -448,20 +512,19 @@ def get_vs_opponent(player_id, opp_abbr):
 
         if len(vs) < 2:
             rs_logs = playergamelog.PlayerGameLog(
-                player_id=player_id, season=SEASON,
-                season_type_all_star="Regular Season",
+                player_id=player_id, season=SEASON, season_type_all_star="Regular Season",
             ).get_data_frames()[0]
             rs_vs = rs_logs[rs_logs["MATCHUP"].str.contains(opp_abbr, na=False, case=False)]
             vs = pd.concat([vs, rs_vs])
             source = "PO+RS" if not po_logs.empty else "RS"
 
         if vs.empty:
-            return jsonify({"success": True, "vsOpponent": None, "gp": 0, "source": None})
+            return {"success": True, "vsOpponent": None, "gp": 0, "source": None}
 
-        return jsonify({"success": True, "vsOpponent": _game_log_avg(vs), "gp": len(vs), "source": source})
+        return {"success": True, "vsOpponent": _game_log_avg(vs), "gp": len(vs), "source": source}
     except Exception as e:
-        logging.error("Error fetching vs-opponent stats: %s", e)
-        return jsonify({"success": False, "error": str(e)}), 500
+        logging.error("Error fetching vs-opponent: %s", e)
+        return {"success": False, "error": str(e)}, 500
 
 
 if __name__ == "__main__":
