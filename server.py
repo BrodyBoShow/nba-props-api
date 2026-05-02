@@ -17,7 +17,7 @@ import time
 import logging
 import threading
 
-SERVER_VERSION = "v5.2-multivar"  # 12-factor + RS-baselined team data
+SERVER_VERSION = "v5.3-multivar"  # 12-factor + 4-day schedule lookahead
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1496,28 +1496,67 @@ def get_schedule():
             logging.warning("Today stats scoreboard fallback failed: %s", e)
             today_games = []
 
-    # ── Tomorrow: stats scoreboard (scheduled games) ─────────────────────────
-    try:
-        tomorrow_games = _fetch_date_games(tomorrow_str)
-    except Exception as e:
-        logging.warning("Tomorrow stats scoreboard failed: %s", e)
-        tomorrow_games = []
+    # ── Upcoming: scan next 4 days to find first day with scheduled games ────
+    # NBA only posts the next day's schedule once series outcomes are known,
+    # so tomorrow may be empty even though games exist 2-3 days out.
+    upcoming_games = []
+    upcoming_date  = tomorrow_str
+    upcoming_label = tomorrow_label
+    for offset in range(1, 5):  # check tomorrow, +2, +3, +4
+        d = now_et + timedelta(days=offset)
+        ds = d.strftime("%m/%d/%Y")
+        try:
+            games = _fetch_date_games(ds)
+        except Exception as e:
+            logging.warning("Date %s lookup failed: %s", ds, e)
+            games = []
+        if games:
+            upcoming_games = games
+            upcoming_date  = ds
+            upcoming_label = d.strftime(f"%b {d.day}")
+            break
 
     return jsonify({
         "success":       True,
         "today":         today_label,
         "todayDate":     today_str,
-        "upcomingLabel": tomorrow_label,
-        "upcomingDate":  tomorrow_str,
+        "upcomingLabel": upcoming_label,
+        "upcomingDate":  upcoming_date,
         "games":         today_games,
         "todayGames":    today_games,
-        "upcomingGames": tomorrow_games,
+        "upcomingGames": upcoming_games,
     })
 
 
 @app.route("/api/version")
 def get_version():
     return {"version": SERVER_VERSION, "ready": _warmup_done.is_set()}
+
+
+@app.route("/api/debug-schedule")
+def debug_schedule():
+    """Diagnostic: fetch raw NBA scoreboard data for next 5 days and report."""
+    from nba_api.stats.endpoints import scoreboard as stats_sb
+    ET = timezone(timedelta(hours=-4))
+    now_et = datetime.now(ET)
+    out = {}
+    for offset in range(0, 6):
+        date = now_et + timedelta(days=offset)
+        date_str = date.strftime("%m/%d/%Y")
+        try:
+            sb = stats_sb.ScoreBoard(game_date=date_str, league_id="00")
+            hdr = sb.game_header.get_data_frame()
+            ls  = sb.line_score.get_data_frame()
+            out[date_str] = {
+                "label":       date.strftime("%a %b %d"),
+                "header_rows": len(hdr) if hdr is not None else 0,
+                "line_rows":   len(ls)  if ls  is not None else 0,
+                "header_cols": hdr.columns.tolist()[:8] if hdr is not None and not hdr.empty else [],
+                "sample":      hdr.iloc[0].to_dict() if hdr is not None and not hdr.empty else {},
+            }
+        except Exception as e:
+            out[date_str] = {"error": str(e), "label": date.strftime("%a %b %d")}
+    return jsonify(out)
 
 
 @app.route("/api/debug-team-defense")
