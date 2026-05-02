@@ -17,7 +17,7 @@ import time
 import logging
 import threading
 
-SERVER_VERSION = "v5.1-multivar"  # 10-factor + bulletproof schedule
+SERVER_VERSION = "v5.2-multivar"  # 12-factor + RS-baselined team data
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -167,9 +167,14 @@ def _build_players():
 
 def _build_teams():
     """
-    Build team stats. Tries multiple measure types because Advanced is often
-    unavailable for current-season data; falls back to Opponent (which gives
-    OPP_PTS/OPP_FGA for defensive quality) then Base.
+    Build team stats with RS as the FOUNDATION (82-game sample) and PO as the
+    overlay (small-sample but recent). Pace comes from RS (stable trait).
+    Final dEFF/oEFF is a sample-weighted blend so first-round teams whose PO
+    stats are entirely from one matchup don't pollute the data.
+
+    Critical fix: previously used PO Advanced exclusively, which made BOS and
+    PHI show identical pace 93.6 and mirror dEFF/oEFF (because they only
+    played each other). Now uses real RS values with PO weighted by GP.
     """
     teams_data = {}
 
@@ -179,71 +184,99 @@ def _build_teams():
             per_mode_detailed="PerGame",
             measure_type_detailed_defense=measure,
         ).get_data_frames()[0]
-        logging.info("Team stats [%s/%s] cols: %s rows: %d",
-                     season_type, measure, df.columns.tolist()[:10], len(df))
+        logging.info("Team stats [%s/%s] rows:%d cols:%s",
+                     season_type, measure, len(df), df.columns.tolist()[:8])
         return df
 
-    # ── PO: try Advanced → Opponent → Base ───────────────────────────────────
-    po_df = None
-    for measure in ("Advanced", "Opponent", "Base"):
-        try:
-            df = _try_team_fetch("Playoffs", measure)
-            _sleep()
-            # Accept DF if it has TEAM_ID or TEAM_ABBREVIATION (current nba_api omits TEAM_ABBREVIATION)
-            has_id = not df.empty and ("TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns)
-            if has_id:
-                po_df = df
-                logging.info("PO team stats loaded via %s measure (%d teams)", measure, len(df))
-                break
-        except Exception as e:
-            logging.warning("PO team stats [%s] failed: %s", measure, e)
+    def _resolve_abbr(row):
+        return (row.get("TEAM_ABBREVIATION")
+                or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
+                or _TEAM_NAME_TO_ABBR.get(row.get("TEAM_NAME", ""))
+                or str(row.get("TEAM_NAME", "UNK"))[:3].upper())
 
+    def _fetch_first_working(season_type):
+        """Try Advanced → Opponent → Base; return (df, measure_used) or (None, None)."""
+        for measure in ("Advanced", "Opponent", "Base"):
+            try:
+                df = _try_team_fetch(season_type, measure)
+                _sleep()
+                if (not df.empty and
+                    ("TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns)):
+                    return df, measure
+            except Exception as e:
+                logging.warning("Team stats [%s/%s] failed: %s", season_type, measure, e)
+        return None, None
+
+    # ── Step 1: RS = foundation (full-season pace + season-long efficiency) ──
+    rs_df, rs_measure = _fetch_first_working("Regular Season")
+    if rs_df is not None:
+        for _, row in rs_df.iterrows():
+            abbr = _resolve_abbr(row)
+            if abbr == "UNK":
+                continue
+            o = row.get("OFF_RATING") or row.get("PTS")
+            d = row.get("DEF_RATING") or row.get("OPP_PTS")
+            teams_data[abbr] = {
+                "fullName":  row.get("TEAM_NAME", abbr),
+                "rsPace":    _f(row.get("PACE") or 100.0),
+                "rsGP":      int(row.get("GP") or 0),
+                "rsOEFF":    _f(o) if o else None,
+                "rsDEFF":    _f(d) if d else None,
+                "poGP":      0,
+                "poPace":    None,
+                "poOEFF":    None,
+                "poDEFF":    None,
+            }
+        logging.info("RS team baseline: %d teams via %s", len(teams_data), rs_measure)
+
+    # ── Step 2: PO overlay (small sample but most recent) ─────────────────────
+    po_df, po_measure = _fetch_first_working("Playoffs")
     if po_df is not None:
         for _, row in po_df.iterrows():
-            # TEAM_ABBREVIATION missing in current nba_api — resolve from TEAM_ID or TEAM_NAME
-            abbr = (row.get("TEAM_ABBREVIATION")
-                    or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
-                    or _TEAM_NAME_TO_ABBR.get(row.get("TEAM_NAME", ""))
-                    or str(row.get("TEAM_NAME", "UNK"))[:3].upper())
-            # Advanced measure has OFF_RATING/DEF_RATING; Opponent measure has OPP_PTS
-            o_eff = row.get("OFF_RATING") or row.get("PTS")     or None
-            d_eff = row.get("DEF_RATING") or row.get("OPP_PTS") or None
-            teams_data[abbr] = {
-                "fullName": row.get("TEAM_NAME", abbr),
-                "rsPace":   _f(row.get("PACE") or 100.0),
-                "oEFF":     _f(o_eff) if o_eff else None,
-                "dEFF":     _f(d_eff) if d_eff else None,
-                "eDIFF":    _f(row.get("NET_RATING")) if row.get("NET_RATING") else None,
-            }
+            abbr = _resolve_abbr(row)
+            if abbr == "UNK":
+                continue
+            if abbr not in teams_data:
+                # Team has PO data but no RS data — uncommon, but handle it
+                teams_data[abbr] = {
+                    "fullName": row.get("TEAM_NAME", abbr),
+                    "rsPace": None, "rsGP": 0, "rsOEFF": None, "rsDEFF": None,
+                }
+            o = row.get("OFF_RATING") or row.get("PTS")
+            d = row.get("DEF_RATING") or row.get("OPP_PTS")
+            teams_data[abbr]["poGP"]   = int(row.get("GP") or 0)
+            teams_data[abbr]["poPace"] = _f(row.get("PACE")) if row.get("PACE") else None
+            teams_data[abbr]["poOEFF"] = _f(o) if o else None
+            teams_data[abbr]["poDEFF"] = _f(d) if d else None
+        logging.info("PO team overlay: %d teams via %s", len(po_df), po_measure)
 
-    # ── RS: for pace only if PO didn't provide it ─────────────────────────────
-    _sleep()
-    if not teams_data:
-        for measure in ("Base", "Opponent"):
-            try:
-                df = _try_team_fetch("Regular Season", measure)
-                _sleep()
-                if not df.empty and ("TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns):
-                    for _, row in df.iterrows():
-                        abbr = (row.get("TEAM_ABBREVIATION")
-                                or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
-                                or _TEAM_NAME_TO_ABBR.get(row.get("TEAM_NAME", ""))
-                                or "UNK")
-                        if abbr not in teams_data:
-                            teams_data[abbr] = {
-                                "fullName": row.get("TEAM_NAME", abbr),
-                                "rsPace":   _f(row.get("PACE") or 100.0),
-                                "oEFF": None, "dEFF": None, "eDIFF": None,
-                            }
-                    logging.info("RS team fallback loaded %d teams", len(teams_data))
-                    break
-            except Exception as e:
-                logging.warning("RS team stats [%s] failed: %s", measure, e)
+    # ── Step 3: Compute final blended dEFF/oEFF ──────────────────────────────
+    # Weight PO based on sample size: 0 PO games = 0% weight, 7+ games = 50% weight.
+    # This prevents 1-2 PO games from drowning out 82 RS games.
+    for abbr, t in teams_data.items():
+        po_gp = int(t.get("poGP") or 0)
+        po_w  = min(0.5, po_gp / 14.0)   # 7 PO games = 50% weight
+        rs_w  = 1.0 - po_w
+
+        rs_d, po_d = t.get("rsDEFF"), t.get("poDEFF")
+        rs_o, po_o = t.get("rsOEFF"), t.get("poOEFF")
+
+        if rs_d and po_d:
+            t["dEFF"] = round(rs_d * rs_w + po_d * po_w, 1)
+        else:
+            t["dEFF"] = rs_d or po_d
+
+        if rs_o and po_o:
+            t["oEFF"] = round(rs_o * rs_w + po_o * po_w, 1)
+        else:
+            t["oEFF"] = rs_o or po_o
+
+        t["eDIFF"] = round((t["oEFF"] or 0) - (t["dEFF"] or 0), 1) if (t["oEFF"] and t["dEFF"]) else None
 
     if not teams_data:
         raise RuntimeError("All team stat fetches failed")
 
-    logging.info("Built %d teams total", len(teams_data))
+    logging.info("Built %d teams total (RS+PO blended)", len(teams_data))
     return teams_data
 
 
@@ -1192,6 +1225,73 @@ def post_project():
             )
     breakdown["usageAdj"] = round(usg_pct_adj * 100, 2)
     corr = round(corr * (1 + usg_pct_adj), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 11 — POST-SEASON ELEVATION (data-verified, no client context)
+    # Some players elevate in playoffs (Jimmy Butler, Jokic, Tatum); others
+    # fade. Compares per-game PO production vs RS for the SAME prop type.
+    # Apply 30% of divergence as adjustment. Cap ±6%. Requires PO sample ≥3.
+    # This signal fires for almost every player — captures playoff-specific form.
+    # ─────────────────────────────────────────────────────────────────────────
+    elev_pct = 0.0
+    po_gp_check = int(po.get("gp") or 0)
+    rs_gp_check = int(rs.get("gp") or 0)
+    if po_gp_check >= 3 and rs_gp_check >= 5 and prop_type in ("points","assists","rebounds","pra","pa","pr","steals","blocks"):
+        key_map = {
+            "points":"ppg", "assists":"apg", "rebounds":"rpg",
+            "steals":"spg", "blocks":"bpg",
+            "pra":("ppg","rpg","apg"), "pa":("ppg","apg"), "pr":("ppg","rpg"),
+        }
+        k = key_map.get(prop_type)
+        if isinstance(k, tuple):
+            po_v = sum(float(po.get(x) or 0) for x in k)
+            rs_v = sum(float(rs.get(x) or 0) for x in k)
+        else:
+            po_v = float(po.get(k) or 0)
+            rs_v = float(rs.get(k) or 0)
+        if po_v > 0 and rs_v > 0:
+            po_lift = (po_v - rs_v) / rs_v
+            if abs(po_lift) >= 0.10:  # ≥10% divergence is meaningful
+                elev_pct = min(0.06, max(-0.06, po_lift * 0.30))
+                elev_abs = round(corr * elev_pct, 2)
+                label = "ELEVATING" if po_lift > 0 else "FADING"
+                drivers.append(
+                    f"Playoff Form — {resolved_name.title()} {label} in PO "
+                    f"({po_v:.1f} per game over {po_gp_check} PO games vs "
+                    f"{rs_v:.1f} over {rs_gp_check} RS games, {po_lift*100:+.1f}%). "
+                    f"Impact: {elev_pct*100:+.1f}% ({elev_abs:+.2f})."
+                )
+    breakdown["playoffFormAdj"] = round(elev_pct * 100, 2)
+    corr = round(corr * (1 + elev_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 12 — DEFENSIVE MATCHUP TYPE (data-verified, no client context)
+    # For SCORING props, factor in opponent's overall dEFF (separately from
+    # the matchup_delta which uses league-avg comparison). This uses the
+    # blended RS+PO dEFF for the most stable signal.
+    # Elite D (≤108) → -2%; Bad D (≥115) → +2%; cap ±2.5%.
+    # ─────────────────────────────────────────────────────────────────────────
+    def_match_pct = 0.0
+    if prop_type in _SCORING_PROPS and opp_team_data:
+        opp_deff = opp_team_data.get("dEFF") or opp_team_data.get("rsDEFF")
+        if opp_deff:
+            opp_deff = float(opp_deff)
+            # Center around 112 (typical PO league avg). Apply 1% per 1.5 dEFF point delta.
+            deff_delta_pts = opp_deff - 112.0
+            def_match_pct = min(0.025, max(-0.025, deff_delta_pts * (0.01 / 1.5)))
+            if abs(def_match_pct) >= 0.005:
+                grade = ("ELITE" if opp_deff <= 108 else
+                         "STRONG" if opp_deff <= 110 else
+                         "AVERAGE" if opp_deff <= 114 else
+                         "WEAK")
+                def_abs = round(corr * def_match_pct, 2)
+                drivers.append(
+                    f"Defensive Tier — {opp_abbr} grades {grade} defense "
+                    f"({opp_deff:.1f} dEFF, blended RS+PO). "
+                    f"Impact: {def_match_pct*100:+.1f}% ({def_abs:+.2f})."
+                )
+    breakdown["defMatchAdj"] = round(def_match_pct * 100, 2)
+    corr = round(corr * (1 + def_match_pct), 2)
 
     # ── No signal found ───────────────────────────────────────────────────────
     if not [d for d in drivers if "NEUTRAL" not in d and "no adjustment" not in d.lower()]:
