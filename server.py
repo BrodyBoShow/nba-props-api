@@ -364,13 +364,9 @@ def _build_hustle():
 
 def _build_tracking():
     """
-    Player tracking stats (Playoffs) — two measure types merged per player:
-      Passing  → POTENTIAL_AST, AST, PASSES_MADE, PASSES_RECEIVED, SECONDARY_AST
-      Rebounding → OREB_CHANCE, DREB_CHANCE, REB_CHANCE_PCT (% of chances secured)
-
-    Core uses in projection engine:
-      • Assist conversion regression: player's PO AST/POTENTIAL_AST vs league baseline
-      • Rebound chance % as a weaker-signal context factor for rebounds prop
+    Player tracking stats (Playoffs) — passing + rebounding merged per player.
+    Passing  → POTENTIAL_AST, AST, PASSES_MADE (for AST conversion rate)
+    Rebounding → OREB_CHANCE, DREB_CHANCE, REB_CHANCE_PCT (optional enrichment)
     """
     logging.info("Fetching PO passing tracking stats...")
     pass_df = leaguedashptstats.LeagueDashPtStats(
@@ -379,22 +375,45 @@ def _build_tracking():
         per_mode_simple="PerGame",
         pt_measure_type="Passing",
     ).get_data_frames()[0]
+    logging.info("Passing tracking cols: %s", pass_df.columns.tolist()[:10])
     _sleep()
 
-    logging.info("Fetching PO rebounding tracking stats...")
-    reb_df = leaguedashptstats.LeagueDashPtStats(
-        season=SEASON,
-        season_type_all_star="Playoffs",
-        per_mode_simple="PerGame",
-        pt_measure_type="Rebounding",
-    ).get_data_frames()[0]
+    # ── Rebounding tracking (optional enrichment — some seasons return different schema) ──
+    reb_idx = {}
+    try:
+        logging.info("Fetching PO rebounding tracking stats...")
+        reb_df = leaguedashptstats.LeagueDashPtStats(
+            season=SEASON,
+            season_type_all_star="Playoffs",
+            per_mode_simple="PerGame",
+            pt_measure_type="Rebounding",
+        ).get_data_frames()[0]
+        logging.info("Rebounding tracking cols: %s", reb_df.columns.tolist()[:10])
 
-    reb_idx = reb_df.set_index("PLAYER_ID").to_dict("index")
+        # The player ID column name varies by nba_api version — detect it
+        pid_col = next(
+            (c for c in ["PLAYER_ID", "PlayerID", "PERSONID"] if c in reb_df.columns),
+            None,
+        )
+        if pid_col:
+            reb_idx = reb_df.set_index(pid_col).to_dict("index")
+            logging.info("Rebounding tracking indexed on %s (%d rows)", pid_col, len(reb_idx))
+        else:
+            logging.warning("Rebounding tracking DF has no player ID column — skipping. Cols: %s",
+                            reb_df.columns.tolist())
+    except Exception as e:
+        logging.warning("Could not build rebounding tracking: %s", e)
+
+    # ── Detect player ID / name columns in passing DF ──────────────────────────
+    pid_col  = next((c for c in ["PLAYER_ID", "PlayerID", "PERSONID"] if c in pass_df.columns), None)
+    name_col = next((c for c in ["PLAYER_NAME", "PlayerName", "PLAYER"] if c in pass_df.columns), None)
 
     tracking = {}
     for _, row in pass_df.iterrows():
-        pid  = int(row["PLAYER_ID"])
-        name = row["PLAYER_NAME"].lower()
+        if pid_col is None or name_col is None:
+            break  # can't build without player identity columns
+        pid  = int(row[pid_col])
+        name = str(row[name_col]).lower()
         reb  = reb_idx.get(pid, {})
 
         potential_ast = _f(row.get("POTENTIAL_AST", 0) or 0)
@@ -402,21 +421,19 @@ def _build_tracking():
         conv_rate     = round(actual_ast / max(potential_ast, 0.1), 3) if potential_ast > 0.1 else None
 
         tracking[name] = {
-            "pid":              pid,
-            "gp":               _i(row.get("GP", 0)),
-            # ── Passing / Assists ──────────────────────────────────────────
-            "potentialAst":     potential_ast,
-            "ast":              actual_ast,
-            "astConvRate":      conv_rate,          # AST / POTENTIAL_AST (e.g. 0.28)
-            "passes":           _f(row.get("PASSES_MADE",      0) or 0),
-            "passesReceived":   _f(row.get("PASSES_RECEIVED",  0) or 0),
-            "secondaryAst":     _f(row.get("SECONDARY_AST",    0) or 0),
-            # ── Rebounding ─────────────────────────────────────────────────
-            "orebChance":       _f(reb.get("OREB_CHANCE",      0) or 0) if reb else 0,
-            "drebChance":       _f(reb.get("DREB_CHANCE",      0) or 0) if reb else 0,
-            "orebChancePct":    _pct(reb.get("OREB_CHANCE_PCT"))  if reb else 0,
-            "drebChancePct":    _pct(reb.get("DREB_CHANCE_PCT"))  if reb else 0,
-            "rebChancePct":     _pct(reb.get("REB_CHANCE_PCT"))   if reb else 0,
+            "pid":            pid,
+            "gp":             _i(row.get("GP", 0)),
+            "potentialAst":   potential_ast,
+            "ast":            actual_ast,
+            "astConvRate":    conv_rate,
+            "passes":         _f(row.get("PASSES_MADE",     0) or 0),
+            "passesReceived": _f(row.get("PASSES_RECEIVED", 0) or 0),
+            "secondaryAst":   _f(row.get("SECONDARY_AST",   0) or 0),
+            "orebChance":     _f(reb.get("OREB_CHANCE",     0) or 0) if reb else 0,
+            "drebChance":     _f(reb.get("DREB_CHANCE",     0) or 0) if reb else 0,
+            "orebChancePct":  _pct(reb.get("OREB_CHANCE_PCT")) if reb else 0,
+            "drebChancePct":  _pct(reb.get("DREB_CHANCE_PCT")) if reb else 0,
+            "rebChancePct":   _pct(reb.get("REB_CHANCE_PCT"))  if reb else 0,
         }
 
     logging.info("Built tracking stats for %d players", len(tracking))
@@ -426,52 +443,76 @@ def _build_tracking():
 def _build_matchup_delta():
     """
     Per-team last-5-game rolling dEFF vs full-PO-season dEFF.
-    Used to apply a Matchup Delta to the projection:
-      dEFF_delta = L5_dEFF − season_dEFF
-      Positive delta → team has gotten softer defensively recently → boost projection
-      Negative delta → team has tightened up defensively → reduce projection
-    Cap ±6%.
+    Positive delta → opp got softer defensively → project UP.  Cap ±6%.
+    Falls back to RS Advanced if PO season data is unavailable.
     """
-    logging.info("Fetching PO L5-game team advanced stats...")
-    l5_df = leaguedashteamstats.LeagueDashTeamStats(
-        season=SEASON,
-        season_type_all_star="Playoffs",
-        per_mode_detailed="PerGame",
-        measure_type_detailed_defense="Advanced",
-        last_n_games=5,
-    ).get_data_frames()[0]
-    _sleep()
+    def _fetch_team_adv(season_type, last_n=0):
+        kwargs = dict(
+            season=SEASON,
+            season_type_all_star=season_type,
+            per_mode_detailed="PerGame",
+            measure_type_detailed_defense="Advanced",
+        )
+        if last_n:
+            kwargs["last_n_games"] = last_n
+        df = leaguedashteamstats.LeagueDashTeamStats(**kwargs).get_data_frames()[0]
+        logging.info("%s last_n=%s cols: %s", season_type, last_n, df.columns.tolist()[:8])
+        return df
 
-    logging.info("Fetching PO season team advanced stats (for matchup delta baseline)...")
-    season_df = leaguedashteamstats.LeagueDashTeamStats(
-        season=SEASON,
-        season_type_all_star="Playoffs",
-        per_mode_detailed="PerGame",
-        measure_type_detailed_defense="Advanced",
-    ).get_data_frames()[0]
+    # ── L5 games (best effort) ────────────────────────────────────────────────
+    l5_df = None
+    for stype in ("Playoffs", "Regular Season"):
+        try:
+            l5_df = _fetch_team_adv(stype, last_n=5)
+            _sleep()
+            if not l5_df.empty and "TEAM_ABBREVIATION" in l5_df.columns:
+                logging.info("L5 team stats from %s (%d teams)", stype, len(l5_df))
+                break
+        except Exception as e:
+            logging.warning("L5 team stats failed for %s: %s", stype, e)
 
-    season_idx = season_df.set_index("TEAM_ABBREVIATION").to_dict("index")
+    if l5_df is None or l5_df.empty:
+        logging.warning("Could not fetch L5 team stats — matchup delta will be empty")
+        return {}
 
+    # ── Season baseline ────────────────────────────────────────────────────────
+    season_idx = {}
+    for stype in ("Playoffs", "Regular Season"):
+        try:
+            season_df = _fetch_team_adv(stype)
+            _sleep()
+            if "TEAM_ABBREVIATION" in season_df.columns and not season_df.empty:
+                season_idx = season_df.set_index("TEAM_ABBREVIATION").to_dict("index")
+                logging.info("Season baseline from %s (%d teams)", stype, len(season_idx))
+                break
+        except Exception as e:
+            logging.warning("Season team stats failed for %s: %s", stype, e)
+
+    # ── Build delta dict ──────────────────────────────────────────────────────
     delta = {}
+    abbr_col = next((c for c in ["TEAM_ABBREVIATION", "TEAM_ABB"] if c in l5_df.columns), None)
+    if abbr_col is None:
+        logging.warning("L5 team DF has no abbreviation column. Cols: %s", l5_df.columns.tolist())
+        return {}
+
     for _, row in l5_df.iterrows():
-        abbr       = row["TEAM_ABBREVIATION"]
-        season     = season_idx.get(abbr, {})
-        l5_dEFF    = _f(row.get("DEF_RATING",  113.5))
-        season_dEFF= _f(season.get("DEF_RATING", 113.5))
-        l5_oEFF    = _f(row.get("OFF_RATING",  113.5))
-        season_oEFF= _f(season.get("OFF_RATING", 113.5))
+        abbr        = row[abbr_col]
+        season      = season_idx.get(abbr, {})
+        l5_dEFF     = _f(row.get("DEF_RATING",  113.5))
+        season_dEFF = _f(season.get("DEF_RATING", l5_dEFF))   # fallback: no delta
+        l5_oEFF     = _f(row.get("OFF_RATING",  113.5))
+        season_oEFF = _f(season.get("OFF_RATING", l5_oEFF))
 
         delta[abbr] = {
-            "l5_dEFF":      l5_dEFF,
-            "season_dEFF":  season_dEFF,
-            # positive = opp got worse defensively recently → project UP
-            "dEFF_delta":   round(l5_dEFF - season_dEFF, 2),
-            "l5_oEFF":      l5_oEFF,
-            "season_oEFF":  season_oEFF,
-            "oEFF_delta":   round(l5_oEFF - season_oEFF, 2),
-            "l5_pace":      _f(row.get("PACE",     100.0)),
-            "season_pace":  _f(season.get("PACE",  100.0)),
-            "gp":           _i(row.get("GP", 0)),
+            "l5_dEFF":     l5_dEFF,
+            "season_dEFF": season_dEFF,
+            "dEFF_delta":  round(l5_dEFF - season_dEFF, 2),
+            "l5_oEFF":     l5_oEFF,
+            "season_oEFF": season_oEFF,
+            "oEFF_delta":  round(l5_oEFF - season_oEFF, 2),
+            "l5_pace":     _f(row.get("PACE",    100.0)),
+            "season_pace": _f(season.get("PACE", 100.0)),
+            "gp":          _i(row.get("GP", 0)),
         }
 
     logging.info("Built matchup delta for %d teams", len(delta))
