@@ -10,13 +10,18 @@ from nba_api.stats.endpoints import (
     playergamelog,
 )
 from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
+from nba_api.stats.static import teams as nba_teams_static
 from datetime import datetime, timezone, timedelta
 import pandas as pd
 import time
 import logging
 import threading
 
-SERVER_VERSION = "v4.1-corr"  # bump to force Render redeploy
+SERVER_VERSION = "v4.2-corr"  # TEAM_ID→abbr fix
+
+# Static TEAM_ID → abbreviation lookup (no API call needed)
+_TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
+_TEAM_NAME_TO_ABBR = {t["full_name"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
@@ -193,7 +198,11 @@ def _build_teams():
 
     if po_df is not None:
         for _, row in po_df.iterrows():
-            abbr = row["TEAM_ABBREVIATION"]
+            # TEAM_ABBREVIATION missing in current nba_api — resolve from TEAM_ID or TEAM_NAME
+            abbr = (row.get("TEAM_ABBREVIATION")
+                    or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
+                    or _TEAM_NAME_TO_ABBR.get(row.get("TEAM_NAME", ""))
+                    or str(row.get("TEAM_NAME", "UNK"))[:3].upper())
             # Advanced measure has OFF_RATING/DEF_RATING; Opponent measure has OPP_PTS
             o_eff = row.get("OFF_RATING") or row.get("PTS")     or None
             d_eff = row.get("DEF_RATING") or row.get("OPP_PTS") or None
@@ -212,9 +221,12 @@ def _build_teams():
             try:
                 df = _try_team_fetch("Regular Season", measure)
                 _sleep()
-                if not df.empty and "TEAM_ABBREVIATION" in df.columns:
+                if not df.empty and ("TEAM_ABBREVIATION" in df.columns or "TEAM_ID" in df.columns):
                     for _, row in df.iterrows():
-                        abbr = row["TEAM_ABBREVIATION"]
+                        abbr = (row.get("TEAM_ABBREVIATION")
+                                or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
+                                or _TEAM_NAME_TO_ABBR.get(row.get("TEAM_NAME", ""))
+                                or "UNK")
                         if abbr not in teams_data:
                             teams_data[abbr] = {
                                 "fullName": row.get("TEAM_NAME", abbr),
@@ -280,8 +292,14 @@ def _build_team_defense():
     logging.info("fg3 team defend cols: %s", fg3_df.columns.tolist())
     logging.info("rim team defend cols: %s", rim_df.columns.tolist())
 
-    fg3_idx = fg3_df.set_index("TEAM_ABBREVIATION").to_dict("index")
-    rim_idx  = rim_df.set_index("TEAM_ABBREVIATION").to_dict("index")
+    def _abbr_from_row(row):
+        return (row.get("TEAM_ABBREVIATION")
+                or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
+                or _TEAM_NAME_TO_ABBR.get(row.get("TEAM_NAME", ""))
+                or "UNK")
+
+    fg3_idx = {_abbr_from_row(r): r.to_dict() for _, r in fg3_df.iterrows()}
+    rim_idx  = {_abbr_from_row(r): r.to_dict() for _, r in rim_df.iterrows()}
 
     # Detect the correct column names (varies by nba_api version)
     sample_fg3 = next(iter(fg3_idx.values()), {})
@@ -292,7 +310,7 @@ def _build_team_defense():
                          if c in sample_fg3), "D_FG_PCT")
     logging.info("Using cols: pct_plus=%s dfg=%s", pct_plus_col, dfg_col)
 
-    all_abbrs = set(fg3_df["TEAM_ABBREVIATION"]) | set(rim_df["TEAM_ABBREVIATION"])
+    all_abbrs = set(fg3_idx.keys()) | set(rim_idx.keys())
     team_def = {}
     for abbr in all_abbrs:
         fg3 = fg3_idx.get(abbr, {})
@@ -539,10 +557,14 @@ def _build_matchup_delta():
                     ).get_data_frames()[0]
                     logging.info("matchup_delta direct [%s/%s] cols:%s rows:%d",
                                  season_type, measure, df.columns.tolist()[:8], len(df))
-                    if df.empty or "TEAM_ABBREVIATION" not in df.columns:
+                    has_id = "TEAM_ID" in df.columns or "TEAM_ABBREVIATION" in df.columns
+                    if df.empty or not has_id:
                         continue
                     for _, row in df.iterrows():
-                        abbr = row["TEAM_ABBREVIATION"]
+                        abbr = (row.get("TEAM_ABBREVIATION")
+                                or _TEAM_ID_TO_ABBR.get(int(row.get("TEAM_ID", 0)))
+                                or _TEAM_NAME_TO_ABBR.get(row.get("TEAM_NAME", ""))
+                                or "UNK")
                         # Advanced → DEF_RATING; Opponent → OPP_PTS; Base → PTS proxy
                         d = row.get("DEF_RATING") or row.get("OPP_PTS") or row.get("PTS") or None
                         o = row.get("OFF_RATING") or row.get("PTS") or None
