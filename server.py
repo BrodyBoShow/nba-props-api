@@ -303,14 +303,18 @@ def _build_team_defense():
     fg3_idx = {_abbr_from_row(r): r.to_dict() for _, r in fg3_df.iterrows()}
     rim_idx  = {_abbr_from_row(r): r.to_dict() for _, r in rim_df.iterrows()}
 
-    # Detect the correct column names (varies by nba_api version)
+    # Column names confirmed from debug-team-defense endpoint (2025-26 nba_api):
+    #   3pt:  PLUSMINUS = FG3_PCT - NS_FG3_PCT,  FG3_PCT = opp 3pt pct
+    #   rim:  PLUSMINUS = LT_06_PCT - NS_LT_06_PCT,  LT_06_PCT = opp rim pct
     sample_fg3 = next(iter(fg3_idx.values()), {})
     sample_rim = next(iter(rim_idx.values()), {})
-    pct_plus_col = next((c for c in ["PCT_PLUSMINUS", "PCT_PLUS_MINUS", "PLUSMINUS"]
-                         if c in sample_fg3), "PCT_PLUSMINUS")
-    dfg_col      = next((c for c in ["D_FG_PCT", "DFG_PCT", "FG_PCT"]
-                         if c in sample_fg3), "D_FG_PCT")
-    logging.info("Using cols: pct_plus=%s dfg=%s", pct_plus_col, dfg_col)
+    vsavg_col   = next((c for c in ["PLUSMINUS", "PCT_PLUSMINUS", "PCT_PLUS_MINUS"]
+                        if c in sample_fg3), "PLUSMINUS")
+    fg3pct_col  = next((c for c in ["FG3_PCT", "D_FG_PCT", "FG_PCT"]
+                        if c in sample_fg3), "FG3_PCT")
+    rim_pct_col = next((c for c in ["LT_06_PCT", "D_FG_PCT", "FG_PCT"]
+                        if c in sample_rim), "LT_06_PCT")
+    logging.info("Team def cols: vsavg=%s fg3pct=%s rimpct=%s", vsavg_col, fg3pct_col, rim_pct_col)
 
     all_abbrs = set(fg3_idx.keys()) | set(rim_idx.keys())
     team_def = {}
@@ -318,10 +322,10 @@ def _build_team_defense():
         fg3 = fg3_idx.get(abbr, {})
         rim = rim_idx.get(abbr, {})
         team_def[abbr] = {
-            "fg3VsAvg":  _f(fg3.get(pct_plus_col, 0), 4),
-            "fg3OppPct": _f(fg3.get(dfg_col, 0), 4),
-            "rimVsAvg":  _f(rim.get(pct_plus_col, 0), 4),
-            "rimOppPct": _f(rim.get(dfg_col, 0), 4),
+            "fg3VsAvg":  _f(fg3.get(vsavg_col,   0), 4),
+            "fg3OppPct": _f(fg3.get(fg3pct_col,  0), 4),
+            "rimVsAvg":  _f(rim.get(vsavg_col,   0), 4),
+            "rimOppPct": _f(rim.get(rim_pct_col, 0), 4),
         }
     logging.info("Built team defense for %d teams", len(team_def))
     return team_def
