@@ -26,18 +26,32 @@ SERVER_VERSION = "v5.6-residual"  # +injury cascade + residual calibration
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
 _TEAM_NAME_TO_ABBR = {t["full_name"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
 
-# ── Static injury overrides — manually maintained, always win over ESPN data ──
-# Updated: May 4 2026 | Status: "Out", "Questionable", "Doubtful", "Probable"
+# ── Injury architecture (updated May 4 2026) ─────────────────────────────────
+# Priority order: _CLEARED_PLAYERS > ESPN live > _INJURY_OVERRIDES (gap-fill only)
+#
+# _CLEARED_PLAYERS  — confirmed ACTIVE, removed from report even if ESPN still lags.
+#                     Add a player here the moment they are confirmed playing.
+# _INJURY_OVERRIDES — ONLY used when ESPN has NO entry for a player (fills ESPN gaps).
+#                     Do NOT put returning/day-to-day players here.
+#                     Use for confirmed season-ending or multi-week absences only.
+# ESPN live data    — primary source of truth, fetched fresh every request.
+
+_CLEARED_PLAYERS = {
+    # Add confirmed-active returning players here so ESPN lag can't mark them OUT
+    "anthony edwards",   # returned from knee injury — confirmed active May 4 2026
+}
+
+# Gap-fill only: applied ONLY when ESPN returns no entry for this player.
+# Keep to truly confirmed, long-term injuries — never day-to-day status.
+# Updated: May 4 2026
 _INJURY_OVERRIDES = {
-    "franz wagner":     {"status": "Out",          "detail": "Calf strain — confirmed OUT (ESPN May 3 2026)", "team": "ORL"},
-    "kevin durant":     {"status": "Out",          "detail": "Left ankle bone bruise — out (NBA official)", "team": "HOU"},
-    "fred vanvleet":    {"status": "Out",          "detail": "Right knee ACL repair — out for season", "team": "CLE"},
-    "donte divincenzo": {"status": "Out",          "detail": "Right Achilles repair — out for season", "team": "NYK"},
-    "luka doncic":      {"status": "Out",          "detail": "Left hamstring strain — no timetable", "team": "LAL"},
-    "steven adams":     {"status": "Out",          "detail": "Left ankle surgery — out for season", "team": "HOU"},
-    "austin reaves":    {"status": "Questionable", "detail": "Left oblique strain — day-to-day", "team": "LAL"},
-    "ayo dosunmu":      {"status": "Out",          "detail": "Injury — confirmed OUT (May 2026)", "team": "MIN"},
-    # anthony edwards: ACTIVE — returned from knee injury, removed from overrides May 4 2026
+    "franz wagner":     {"status": "Out", "detail": "Calf strain — confirmed OUT (ESPN May 3 2026)", "team": "ORL"},
+    "kevin durant":     {"status": "Out", "detail": "Left ankle bone bruise — out (NBA official)", "team": "HOU"},
+    "fred vanvleet":    {"status": "Out", "detail": "Right knee ACL repair — out for season", "team": "CLE"},
+    "donte divincenzo": {"status": "Out", "detail": "Right Achilles repair — out for season", "team": "NYK"},
+    "luka doncic":      {"status": "Out", "detail": "Left hamstring strain — no timetable", "team": "LAL"},
+    "steven adams":     {"status": "Out", "detail": "Left ankle surgery — out for season", "team": "HOU"},
+    "ayo dosunmu":      {"status": "Out", "detail": "Injury — confirmed OUT (May 2026)", "team": "MIN"},
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -1817,9 +1831,15 @@ def get_injuries():
     except Exception as e:
         logging.warning("ESPN injury fetch failed (using static only): %s", e)
 
-    # Static overrides always override ESPN — these are manually verified
+    # Gap-fill: static overrides only apply when ESPN has NO entry for this player.
+    # ESPN live data is the primary truth — overrides never clobber it.
     for name, info in _INJURY_OVERRIDES.items():
-        merged[name] = {**info, "source": "override"}
+        if name not in merged:
+            merged[name] = {**info, "source": "override"}
+
+    # Remove players confirmed active — clears ESPN lag for returning players.
+    for name in _CLEARED_PLAYERS:
+        merged.pop(name, None)
 
     return jsonify({
         "success":  True,
