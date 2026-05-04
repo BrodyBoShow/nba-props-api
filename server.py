@@ -20,11 +20,24 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v5.5-multivar"  # baseline synced with client (L5-weighted)
+SERVER_VERSION = "v5.6-residual"  # +injury cascade + residual calibration
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
 _TEAM_NAME_TO_ABBR = {t["full_name"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
+
+# ── Static injury overrides — manually maintained, always win over ESPN data ──
+# Updated: May 4 2026 | Status: "Out", "Questionable", "Doubtful", "Probable"
+_INJURY_OVERRIDES = {
+    "franz wagner":     {"status": "Out",          "detail": "Calf strain — confirmed OUT (ESPN May 3 2026)", "team": "ORL"},
+    "kevin durant":     {"status": "Out",          "detail": "Left ankle bone bruise — out (NBA official)", "team": "HOU"},
+    "fred vanvleet":    {"status": "Out",          "detail": "Right knee ACL repair — out for season", "team": "CLE"},
+    "anthony edwards":  {"status": "Out",          "detail": "Left knee hyperextension + bone bruise", "team": "MIN"},
+    "donte divincenzo": {"status": "Out",          "detail": "Right Achilles repair — out for season", "team": "NYK"},
+    "luka doncic":      {"status": "Out",          "detail": "Left hamstring strain — no timetable", "team": "LAL"},
+    "steven adams":     {"status": "Out",          "detail": "Left ankle surgery — out for season", "team": "HOU"},
+    "austin reaves":    {"status": "Questionable", "detail": "Left oblique strain — day-to-day", "team": "LAL"},
+}
 
 logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
@@ -896,6 +909,8 @@ def post_project():
     team_abbr    = (body.get("team_abbr") or "").strip().upper()  # player's own team
     is_home      = body.get("is_home")       # bool: player playing at home?
     high_leverage = bool(body.get("high_leverage"))  # Game 7, elimination, etc.
+    # Residual calibration — client sends stored projection/actual pairs from localStorage
+    prior_residuals = body.get("prior_residuals") or []   # [{projected, actual, date}, ...]
 
     if not player_name:
         return jsonify({"success": False, "error": "player_name is required"}), 400
@@ -1322,6 +1337,101 @@ def post_project():
     breakdown["defMatchAdj"] = round(def_match_pct * 100, 2)
     corr = round(corr * (1 + def_match_pct), 2)
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 13 — INJURY CASCADE (teammate OUT → usage boost; own GTD → penalty)
+    # Uses _INJURY_OVERRIDES to detect confirmed OUT teammates on the same team.
+    # Freed usage (PPG) redistributes proportionally to remaining players' USG%.
+    # This is the #1 real-world edge: sportsbooks are slow to update lines for DNPs.
+    #   • Teammate OUT with ≥8 PPG → proportional boost (cap +15%)
+    #   • Player themselves is Questionable/Doubtful → conservative -8% penalty
+    # ─────────────────────────────────────────────────────────────────────────
+    inj_cascade_pct = 0.0
+    own_inj = (_INJURY_OVERRIDES.get(resolved_name)
+               or _INJURY_OVERRIDES.get(player_name)
+               or {})
+    if own_inj.get("status") in ("Questionable", "Doubtful"):
+        inj_cascade_pct = -0.08
+        inj_abs = round(corr * inj_cascade_pct, 2)
+        drivers.append(
+            f"Injury Uncertainty — {resolved_name.title()} is {own_inj['status']} "
+            f"({own_inj.get('detail','undisclosed')}). "
+            f"GTD penalty: {inj_cascade_pct*100:+.1f}% ({inj_abs:+.2f})."
+        )
+    elif prop_type in _COUNTING_PROPS and own_team:
+        full_players = (_cache_get("players") or {}).get("players", {})
+        teammates_out, remaining_usg = [], 0.0
+        for tname, tdata in full_players.items():
+            if tdata.get("team") != own_team or tname == resolved_name:
+                continue
+            t_inj = _INJURY_OVERRIDES.get(tname) or {}
+            t_usg = float(tdata.get("po", {}).get("usg") or tdata.get("rs", {}).get("usg") or 0)
+            t_ppg = float(tdata.get("po", {}).get("ppg") or tdata.get("rs", {}).get("ppg") or 0)
+            if t_inj.get("status") == "Out" and t_ppg >= 8.0:
+                teammates_out.append({"name": tname, "ppg": t_ppg, "usg": t_usg})
+            else:
+                remaining_usg += t_usg
+        if teammates_out:
+            my_usg  = float(po.get("usg") or rs.get("usg") or 0)
+            pool    = remaining_usg + my_usg
+            if my_usg > 0 and pool > 0:
+                freed   = sum(p["ppg"] for p in teammates_out)
+                share   = my_usg / pool
+                boost   = freed * share
+                my_ppg  = float(po.get("ppg") or rs.get("ppg") or 1)
+                raw_pct = boost / max(my_ppg, 1)
+                inj_cascade_pct = min(0.15, max(0.0, raw_pct))
+                if inj_cascade_pct >= 0.01:
+                    boost_abs  = round(corr * inj_cascade_pct, 2)
+                    out_names  = ", ".join(p["name"].title() for p in teammates_out[:3])
+                    drivers.append(
+                        f"Injury Cascade — {out_names} OUT ({freed:.1f} freed PPG). "
+                        f"{resolved_name.title()} absorbs ~{share*100:.0f}% of load "
+                        f"(USG {my_usg:.0f}%). Boost: {inj_cascade_pct*100:+.1f}% ({boost_abs:+.2f})."
+                    )
+    breakdown["injCascadeAdj"] = round(inj_cascade_pct * 100, 2)
+    corr = round(corr * (1 + inj_cascade_pct), 2)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # ADJUSTMENT 14 — RESIDUAL CALIBRATION (model learns from historical errors)
+    # Client sends prior_residuals: [{projected, actual, date}] stored in localStorage.
+    # Computes weighted mean bias (actual - projected / projected) and corrects it.
+    # Recent samples weighted more heavily (sqrt-scale). Requires ≥3 samples.
+    # Cap ±12% — prevents overfitting on small samples. Only fires if bias ≥2%.
+    # This is what separates a static model from a learning one — no hallucinations,
+    # only hard numerical residuals from real game outcomes the user logged.
+    # ─────────────────────────────────────────────────────────────────────────
+    residual_pct = 0.0
+    residual_n   = min(len(prior_residuals), 20)
+    if residual_n >= 3:
+        try:
+            samples = prior_residuals[-10:]   # cap at last 10
+            weighted_errors = []
+            for i, r in enumerate(samples):
+                p_val = float(r.get("projected") or 0)
+                a_val = float(r.get("actual")    or 0)
+                if p_val > 0.5:
+                    rel_err = (a_val - p_val) / p_val
+                    weight  = (i + 1) ** 0.5  # recency: √(index) — older gets less weight
+                    weighted_errors.append((rel_err, weight))
+            if weighted_errors:
+                total_w   = sum(w for _, w in weighted_errors)
+                mean_bias = sum(e * w for e, w in weighted_errors) / total_w
+                if abs(mean_bias) >= 0.02:   # only act on meaningful systematic bias
+                    residual_pct = max(-0.12, min(0.12, mean_bias))
+                    res_abs      = round(corr * residual_pct, 2)
+                    direction    = "under" if mean_bias > 0 else "over"
+                    drivers.append(
+                        f"Residual Learning ({residual_n} game sample) — model has "
+                        f"historically {direction}-projected this prop by "
+                        f"{abs(mean_bias)*100:.1f}%. "
+                        f"Calibration: {residual_pct*100:+.1f}% ({res_abs:+.2f})."
+                    )
+        except (TypeError, ValueError, ZeroDivisionError) as e:
+            logging.warning("Residual calibration error: %s", e)
+    breakdown["residualCalibAdj"] = round(residual_pct * 100, 2)
+    breakdown["residualN"]        = residual_n
+    corr = round(corr * (1 + residual_pct), 2)
+
     # ── No signal found ───────────────────────────────────────────────────────
     if not [d for d in drivers if "NEUTRAL" not in d and "no adjustment" not in d.lower()]:
         drivers.append(
@@ -1667,6 +1777,54 @@ def get_schedule():
         "games":         today_games,
         "todayGames":    today_games,
         "upcomingGames": upcoming_games,
+    })
+
+
+@app.route("/api/injuries")
+def get_injuries():
+    """
+    Live injury report: ESPN public API enriched by static _INJURY_OVERRIDES.
+    Static overrides always win — they represent manually verified confirmed statuses.
+    ESPN adds any players not in the overrides (best-effort live enrichment).
+    Never returns AI-hallucinated data — ESPN or static only.
+    """
+    merged = {}
+
+    # Try ESPN live injury feed first
+    try:
+        url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        for entry in (data.get("injuries") or []):
+            try:
+                athlete   = entry.get("athlete") or {}
+                name      = (athlete.get("displayName") or "").strip().lower()
+                status    = (entry.get("status") or "").strip()
+                team_info = (athlete.get("team") or {})
+                team      = team_info.get("abbreviation", "")
+                det       = entry.get("details") or {}
+                detail    = det.get("detail") or det.get("type") or status
+                if name and status:
+                    merged[name] = {
+                        "status": status, "detail": detail,
+                        "team": team, "source": "espn_live",
+                    }
+            except Exception:
+                continue
+        logging.info("ESPN injuries: loaded %d entries", len(merged))
+    except Exception as e:
+        logging.warning("ESPN injury fetch failed (using static only): %s", e)
+
+    # Static overrides always override ESPN — these are manually verified
+    for name, info in _INJURY_OVERRIDES.items():
+        merged[name] = {**info, "source": "override"}
+
+    return jsonify({
+        "success":  True,
+        "injuries": merged,
+        "count":    len(merged),
+        "updated":  datetime.now(timezone.utc).strftime("%b %-d, %-I:%M %p ET"),
     })
 
 
