@@ -65,6 +65,7 @@ _INJURY_OVERRIDES = {
     "luka doncic":      {"status": "Out", "detail": "Left hamstring strain — no timetable", "team": "LAL"},
     "steven adams":     {"status": "Out", "detail": "Left ankle surgery — out for season", "team": "HOU"},
     "ayo dosunmu":      {"status": "Out", "detail": "Injury — confirmed OUT (May 2026)", "team": "MIN"},
+    "joel embiid":      {"status": "Out", "detail": "Confirmed OUT — May 6 2026", "team": "PHI"},
 }
 
 logging.basicConfig(level=logging.INFO)
