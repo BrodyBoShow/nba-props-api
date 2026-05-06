@@ -21,7 +21,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.1-confidence"  # +confidence band +blowout discount +injury cap bump
+SERVER_VERSION = "v6.2-ra"  # +R+A prop type
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -839,7 +839,7 @@ _TS_GOOD_THRESH        = 55.0   # TS% above this = efficient
 _TS_BAD_THRESH         = 50.0   # TS% below this = inefficient
 _CLUTCH_LIFT_THRESH    = 0.20   # ±20% clutch divergence → meaningful signal
 _COUNTING_PROPS = ("points","assists","rebounds","steals","blocks",
-                   "pra","pa","pr","three_pointers")
+                   "pra","pa","pr","ra","three_pointers")
 _SCORING_PROPS  = ("points","pra","pa","pr","three_pointers")
 
 
@@ -991,6 +991,9 @@ def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
     elif prop_type == "pr":
         po_v = _s(po,"ppg") + _s(po,"rpg")
         rs_v = _s(rs,"ppg") + _s(rs,"rpg")
+    elif prop_type == "ra":
+        po_v = _s(po,"rpg") + _s(po,"apg")
+        rs_v = _s(rs,"rpg") + _s(rs,"apg")
     elif prop_type == "three_pointers":
         pct = float((scoring_row or {}).get("pctPts3pt") or 0)
         po_v = _s(po,"ppg") * (pct / 100) / 3 if pct > 0 else 0
@@ -1164,7 +1167,7 @@ def post_project():
     # Only fires for assist-bearing props (assists, pa, pra).
     # ─────────────────────────────────────────────────────────────────────────
     ast_conv_delta = 0.0
-    if prop_type in ("assists", "pa", "pra") and tracking_row:
+    if prop_type in ("assists", "pa", "pra", "ra") and tracking_row:
         gp        = int(tracking_row.get("gp") or 0)
         conv_rate = tracking_row.get("astConvRate")
         if conv_rate is not None and gp >= 2:
@@ -1293,7 +1296,7 @@ def post_project():
     # shift in projection. Cap ±8%.
     # ─────────────────────────────────────────────────────────────────────────
     hustle_delta = 0.0
-    if prop_type in ("rebounds", "pr", "pra") and tracking_row:
+    if prop_type in ("rebounds", "pr", "pra", "ra") and tracking_row:
         gp              = int(tracking_row.get("gp") or 0)
         reb_chance_pct  = float(tracking_row.get("rebChancePct") or 0)
         total_chances   = float((tracking_row.get("orebChance") or 0) +
@@ -1364,7 +1367,8 @@ def post_project():
             def _s2(d, k): return float(d.get(k) or 0)
             key_map_2 = {"points":"ppg","assists":"apg","rebounds":"rpg",
                          "steals":"spg","blocks":"bpg",
-                         "pra":("ppg","rpg","apg"),"pa":("ppg","apg"),"pr":("ppg","rpg")}
+                         "pra":("ppg","rpg","apg"),"pa":("ppg","apg"),"pr":("ppg","rpg"),
+                         "ra":("rpg","apg")}
             k2 = key_map_2.get(prop_type)
             if k2 and l5 > 0:
                 if isinstance(k2, tuple):
@@ -1424,12 +1428,12 @@ def post_project():
     # Cap ±6%. Requires client to pass is_home and prop must be home/road relevant.
     # ─────────────────────────────────────────────────────────────────────────
     splits_pct = 0.0
-    if splits_row and is_home is not None and prop_type in ("points","assists","rebounds","pra","pa","pr"):
+    if splits_row and is_home is not None and prop_type in ("points","assists","rebounds","pra","pa","pr","ra"):
         home = splits_row.get("home") or {}
         road = splits_row.get("road") or {}
         key_map = {
             "points":"ppg", "assists":"apg", "rebounds":"rpg",
-            "pra":["ppg","rpg","apg"], "pa":["ppg","apg"], "pr":["ppg","rpg"],
+            "pra":["ppg","rpg","apg"], "pa":["ppg","apg"], "pr":["ppg","rpg"], "ra":["rpg","apg"],
         }
         k = key_map.get(prop_type)
         h_gp = int(home.get("gp") or 0)
@@ -1476,6 +1480,7 @@ def post_project():
         "three_pointers": ("ppg", "ppg", "pts", 0.6),
         "rebounds":       ("rpg", "rpg", "reb", 0.4),
         "assists":        ("apg", "apg", "ast", 0.3),
+        "ra":             ("rpg", "rpg", "reb+ast", 0.4),
     }
     if high_leverage and clutch_row and prop_type in _CLUTCH_STAT_MAP:
         c_key, r_key, stat_lbl, abs_cap = _CLUTCH_STAT_MAP[prop_type]
@@ -1539,11 +1544,11 @@ def post_project():
     elev_pct = 0.0
     po_gp_check = int(po.get("gp") or 0)
     rs_gp_check = int(rs.get("gp") or 0)
-    if po_gp_check >= 3 and rs_gp_check >= 5 and prop_type in ("points","assists","rebounds","pra","pa","pr","steals","blocks"):
+    if po_gp_check >= 3 and rs_gp_check >= 5 and prop_type in ("points","assists","rebounds","pra","pa","pr","ra","steals","blocks"):
         key_map = {
             "points":"ppg", "assists":"apg", "rebounds":"rpg",
             "steals":"spg", "blocks":"bpg",
-            "pra":("ppg","rpg","apg"), "pa":("ppg","apg"), "pr":("ppg","rpg"),
+            "pra":("ppg","rpg","apg"), "pa":("ppg","apg"), "pr":("ppg","rpg"), "ra":("rpg","apg"),
         }
         k = key_map.get(prop_type)
         if isinstance(k, tuple):
@@ -1625,6 +1630,7 @@ def post_project():
             "pra":      ("ppg", "ppg", 8.0,  "PPG"),
             "pa":       ("ppg", "ppg", 8.0,  "PPG"),
             "pr":       ("ppg", "ppg", 8.0,  "PPG"),
+            "ra":       ("rpg", "rpg", 4.0,  "RPG"),
             "rebounds": ("rpg", "rpg", 4.0,  "RPG"),
             "assists":  ("apg", "apg", 3.0,  "APG"),
             "steals":   ("spg", "spg", 0.5,  "SPG"),
