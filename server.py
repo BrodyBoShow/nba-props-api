@@ -1,3 +1,4 @@
+import math
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from nba_api.stats.endpoints import (
@@ -20,11 +21,23 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v5.6-residual"  # +injury cascade + residual calibration
+SERVER_VERSION = "v6.0-refactor"  # rate×min baseline, dynamic weights, sigmoid caps, EWMA defense composite
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
 _TEAM_NAME_TO_ABBR = {t["full_name"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
+_TEAM_ABBR_TO_ID  = {v: k for k, v in _TEAM_ID_TO_ABBR.items()}
+
+# ESPN uses shorter abbreviations that differ from NBA stats API
+# Normalize ESPN → NBA so scoreboard enrichment key-matching works
+_ESPN_TO_NBA_ABBR = {
+    "SA": "SAS", "GS": "GSW", "NY": "NYK", "NO": "NOP",
+    "UTAH": "UTA", "MEM": "MEM", "PHX": "PHX",
+}
+
+def _norm_abbr(abbr: str) -> str:
+    """Normalize ESPN/short abbreviation to NBA stats API abbreviation."""
+    return _ESPN_TO_NBA_ABBR.get((abbr or "").upper(), (abbr or "").upper())
 
 # ── Injury architecture (updated May 4 2026) ─────────────────────────────────
 # Priority order: _CLEARED_PLAYERS > ESPN live > _INJURY_OVERRIDES (gap-fill only)
@@ -830,6 +843,65 @@ _COUNTING_PROPS = ("points","assists","rebounds","steals","blocks",
 _SCORING_PROPS  = ("points","pra","pa","pr","three_pointers")
 
 
+# ── Math utility functions ────────────────────────────────────────────────────
+
+def _soft_cap(x: float, cap: float, k: float = 1.5) -> float:
+    """
+    Smooth asymptotic cap using tanh instead of a hard min/max clamp.
+    Replaces all hard-cap patterns: min(cap, max(-cap, x)).
+
+    Formula: f(x) = L * tanh(k * x / L)   where L = cap * 1.2
+      • f(0)    = 0           (zero input → zero output)
+      • f(cap)  ≈ cap         (at the old hard-cap value, output matches it)
+      • f(2cap) ≈ cap * 1.18  (extreme outliers get ~20% headroom, never clamp hard)
+      • Sign-preserving, monotonic
+
+    k=1.5 calibrated so f(cap) / L = tanh(1.5/1.2) ≈ 0.848 → output ≈ 1.018*cap.
+    """
+    if cap <= 0:
+        return 0.0
+    L = cap * 1.2
+    return L * math.tanh(k * x / L)
+
+
+def _dynamic_weights(po_gp: int, rs_gp: int, has_l5: bool) -> tuple:
+    """
+    Replace static PO/RS/L5 weights with logarithmic sample-size scaling.
+
+    Design goals:
+      • PO weight grows as log(po_gp): more playoff evidence → trust it more
+      • RS weight diluted by PO growth but FLOORED at 5% to prevent instability
+      • L5 stays fixed at 35% when available (highest predictive value for recent form)
+
+    Returns (po_weight, rs_weight, l5_weight)  — always sum to 1.0.
+
+    Sample walk-through (with L5):
+      po_gp=3  → (0.25, 0.40, 0.35)  — early, RS anchors
+      po_gp=6  → (0.35, 0.30, 0.35)  — PO earning its weight
+      po_gp=12 → (0.46, 0.19, 0.35)  — PO dominant
+      po_gp=21 → (0.50, 0.15, 0.35)  — max PO, RS floored
+    """
+    if po_gp < 3 or rs_gp < 5:
+        # Insufficient PO sample — PO-only or RS-only
+        if po_gp >= 1:
+            return (1.0, 0.0, 0.0)
+        return (0.0, 1.0, 0.0)
+
+    if has_l5:
+        L5_W = 0.35
+        # PO: log-scale anchored at 0.25 when gp=3, caps at 0.50 around gp=21
+        po_raw = min(0.50, 0.25 * math.log1p(po_gp) / math.log1p(3))
+        rs_w = max(0.05, 1.0 - L5_W - po_raw)
+        po_w = 1.0 - L5_W - rs_w
+        return (round(po_w, 4), round(rs_w, 4), L5_W)
+    else:
+        # No L5: PO/RS only. PO log-scales from 0.45 at gp=3 to 0.75 at gp=21+
+        po_raw = min(0.75, 0.45 * math.log1p(po_gp) / math.log1p(3))
+        rs_w = max(0.05, 1.0 - po_raw)
+        po_w = 1.0 - rs_w
+        return (round(po_w, 4), round(rs_w, 4), 0.0)
+
+
 def _resolve_player(name: str, players_cache: dict):
     """Exact match first, then substring, then None."""
     if name in players_cache:
@@ -840,56 +912,120 @@ def _resolve_player(name: str, players_cache: dict):
     return None, None
 
 
-def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None):
+def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
+               l5_min=None, own_team_data=None, opp_team_data=None):
     """
-    Return the weighted blended base stat. SYNCED with client baseline so
-    client and server start from the same number:
-       L5 available + sufficient PO/RS sample → PO 40% + RS 25% + L5 35%
-       PO + RS only                            → PO 65% + RS 35%
-       PO only                                 → PO
-       RS only                                 → RS
+    Rate × Minutes baseline — decouples per-minute production from playing time.
 
-    L5 is the most predictive short-term signal (recent form).
+    Pipeline:
+      1. Resolve stat value for the prop type from PO/RS dicts
+      2. Compute per-minute rate (stat / minutes) for PO and RS
+      3. Project blended minutes: PO_min × po_w + RS_min × rs_w (pace-adjusted)
+      4. Apply _dynamic_weights() for log-scaled sample-size blending
+      5. base = blended_per_min_rate × projected_minutes
+
+    Fallback (when minutes data is insufficient < 5 min/game):
+      Falls back to per-game average blend using _dynamic_weights().
+      This keeps backwards compatibility when l5_min is not provided.
+
+    Returns (base: float, use_rate_base: bool)
+      use_rate_base=True  → pace already baked into minutes; Adj 5 should skip.
+      use_rate_base=False → per-game fallback; Adj 5 should still fire.
     """
     def _s(d, k): return float(d.get(k) or 0)
 
+    po_gp = int(po.get("gp") or 0)
+    rs_gp = int(rs.get("gp") or 0)
+    po_min = _s(po, "min")
+    rs_min = _s(rs, "min")
+
+    # ── Resolve stat values for this prop type ───────────────────────────────
     if prop_type == "pra":
-        po_v = _s(po, "ppg") + _s(po, "rpg") + _s(po, "apg")
-        rs_v = _s(rs, "ppg") + _s(rs, "rpg") + _s(rs, "apg")
+        po_v = _s(po,"ppg") + _s(po,"rpg") + _s(po,"apg")
+        rs_v = _s(rs,"ppg") + _s(rs,"rpg") + _s(rs,"apg")
     elif prop_type == "pa":
-        po_v = _s(po, "ppg") + _s(po, "apg")
-        rs_v = _s(rs, "ppg") + _s(rs, "apg")
+        po_v = _s(po,"ppg") + _s(po,"apg")
+        rs_v = _s(rs,"ppg") + _s(rs,"apg")
     elif prop_type == "pr":
-        po_v = _s(po, "ppg") + _s(po, "rpg")
-        rs_v = _s(rs, "ppg") + _s(rs, "rpg")
+        po_v = _s(po,"ppg") + _s(po,"rpg")
+        rs_v = _s(rs,"ppg") + _s(rs,"rpg")
     elif prop_type == "three_pointers":
         pct = float((scoring_row or {}).get("pctPts3pt") or 0)
-        po_v = _s(po, "ppg") * (pct / 100) / 3 if pct > 0 else 0
-        rs_v = _s(rs, "ppg") * (pct / 100) / 3 if pct > 0 else 0
+        po_v = _s(po,"ppg") * (pct / 100) / 3 if pct > 0 else 0
+        rs_v = _s(rs,"ppg") * (pct / 100) / 3 if pct > 0 else 0
     else:
-        key_map = {"points": "ppg", "assists": "apg", "rebounds": "rpg",
-                   "steals": "spg", "blocks": "bpg"}
+        key_map = {"points":"ppg","assists":"apg","rebounds":"rpg",
+                   "steals":"spg","blocks":"bpg"}
         k = key_map.get(prop_type, "ppg")
         po_v, rs_v = _s(po, k), _s(rs, k)
 
-    po_gp = int(po.get("gp") or 0)
-    rs_gp = int(rs.get("gp") or 0)
+    has_l5 = (l5_avg is not None)
+    try:
+        l5_v = float(l5_avg) if has_l5 else 0.0
+        has_l5 = has_l5 and l5_v > 0
+    except (TypeError, ValueError):
+        has_l5, l5_v = False, 0.0
 
-    # Try L5-aware blend first (matches client formula exactly)
-    if l5_avg is not None and po_gp >= 3 and rs_gp >= 5:
-        try:
-            l5 = float(l5_avg)
-            if l5 > 0:
-                return round(po_v * 0.40 + rs_v * 0.25 + l5 * 0.35, 2)
-        except (TypeError, ValueError):
-            pass
+    # ── Dynamic sample-size weights ──────────────────────────────────────────
+    po_w, rs_w, l5_w = _dynamic_weights(po_gp, rs_gp, has_l5)
 
-    # Fallback hierarchy
-    if po_gp >= 3 and rs_gp >= 5:
-        return round(po_v * 0.65 + rs_v * 0.35, 2)
+    # ── Rate × Minutes approach (requires ≥5 min/game in both PO and RS) ─────
+    if po_min >= 5.0 and rs_min >= 5.0 and po_v > 0 and rs_v > 0:
+        po_pm = po_v / po_min   # stat per minute in playoffs
+        rs_pm = rs_v / rs_min   # stat per minute in regular season
+
+        # L5 per-minute rate — requires client to send l5_min alongside l5_avg
+        has_l5_min = False
+        l5_pm = None
+        if has_l5 and l5_min is not None:
+            try:
+                l5_min_f = float(l5_min)
+                if l5_min_f >= 5.0:
+                    l5_pm = l5_v / l5_min_f
+                    has_l5_min = True
+            except (TypeError, ValueError):
+                pass
+
+        # Blended per-minute rate
+        if has_l5_min and l5_pm is not None and l5_w > 0:
+            blended_pm = po_pm * po_w + rs_pm * rs_w + l5_pm * l5_w
+        else:
+            # Renormalize PO+RS weights without L5 component
+            total_w = po_w + rs_w
+            blended_pm = (po_pm * po_w + rs_pm * rs_w) / total_w if total_w > 0 else po_pm
+
+        # Project minutes: blend of PO / RS / (optional) L5 minutes
+        if has_l5_min and l5_w > 0:
+            proj_min = po_min * po_w + rs_min * rs_w + float(l5_min) * l5_w
+        else:
+            total_w = po_w + rs_w
+            proj_min = (po_min * po_w + rs_min * rs_w) / total_w if total_w > 0 else po_min
+
+        # Pace-adjust projected minutes directly (replaces Adj 5 when use_rate_base=True)
+        # Faster game pace → marginally more clock time for key players.
+        # Effect on minutes is weaker than on counting stats (~30% of full pace signal).
+        if own_team_data and opp_team_data:
+            own_pace = float(own_team_data.get("rsPace") or _LEAGUE_AVG_PACE)
+            opp_pace = float(opp_team_data.get("rsPace") or _LEAGUE_AVG_PACE)
+            game_pace = (own_pace + opp_pace) / 2.0
+            pace_delta = (game_pace - _LEAGUE_AVG_PACE) / _LEAGUE_AVG_PACE
+            min_pace_adj = _soft_cap(pace_delta * 0.30, 0.04)  # sigmoid, max ±4% on minutes
+            proj_min = proj_min * (1.0 + min_pace_adj)
+
+        base = round(blended_pm * proj_min, 2)
+        return base, True   # use_rate_base=True → caller skips Adj 5
+
+    # ── Fallback: per-game averages with dynamic weights ─────────────────────
+    if has_l5 and l5_w > 0:
+        base = round(po_v * po_w + rs_v * rs_w + l5_v * l5_w, 2)
+    elif po_gp >= 3 and rs_gp >= 5:
+        total_w = po_w + rs_w
+        base = round((po_v * po_w + rs_v * rs_w) / total_w, 2) if total_w > 0 else round(po_v, 2)
     elif po_gp >= 1:
-        return round(po_v, 2)
-    return round(rs_v, 2)
+        base = round(po_v, 2)
+    else:
+        base = round(rs_v, 2)
+    return base, False   # use_rate_base=False → caller lets Adj 5 fire normally
 
 
 @app.route("/api/project", methods=["POST"])
@@ -920,6 +1056,7 @@ def post_project():
     book_line    = body.get("book_line")
     # Optional context from client (enriches server projection — never fabricated)
     l5_avg       = body.get("l5_avg")        # client-computed L5 PO avg for this prop
+    l5_min       = body.get("l5_min")        # client-computed L5 PO minutes/game (from /api/recent)
     rest_days    = body.get("rest_days")     # player's team rest days (int)
     team_abbr    = (body.get("team_abbr") or "").strip().upper()  # player's own team
     is_home      = body.get("is_home")       # bool: player playing at home?
@@ -965,11 +1102,16 @@ def post_project():
     own_team_data = teams_cache.get(own_team, {}) if own_team else {}
     opp_team_data = teams_cache.get(opp_abbr, {}) if opp_abbr else {}
 
-    # ── Base projection (L5-aware to match client baseline exactly) ──────────
-    base = _base_stat(po, rs, prop_type, scoring_row, l5_avg=l5_avg)
+    # ── Base projection — Rate×Minutes with dynamic sample-size weights ───────
+    base, use_rate_base = _base_stat(
+        po, rs, prop_type, scoring_row,
+        l5_avg=l5_avg, l5_min=l5_min,
+        own_team_data=own_team_data, opp_team_data=opp_team_data,
+    )
     corr = base
     drivers   = []
     breakdown = {}
+    breakdown["use_rate_base"] = use_rate_base
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 1 — AST CONVERSION WEIGHT
@@ -1006,31 +1148,70 @@ def post_project():
     corr = round(corr + ast_conv_delta, 2)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 2 — MATCHUP DELTA (dEFF rolling momentum)
-    # For every 1.0 pt increase in the opponent's L5 dEFF vs season dEFF
-    # (defense has gotten WORSE recently), increase projection by +1.5%.
-    # Negative delta = tightening defense → reduce projection.
-    # Only fires for scoring-bearing props. Cap ±9%.
+    # ADJUSTMENT 2 — OPPONENT DEFENSE COMPOSITE (EWMA — replaces old Adj 2 + Adj 12)
+    #
+    # COLLINEARITY FIX: The old Adj 2 (matchup delta) and Adj 12 (defensive tier)
+    # were both derived from the same underlying dEFF signal, applied twice against
+    # different baselines (league avg vs 112). This double-counted defensive variance.
+    #
+    # New approach: single EWMA that blends two TRUE data layers:
+    #   • PO dEFF  = opponent's playoff defensive rating (small sample, most recent)
+    #   • RS dEFF  = opponent's full regular-season defensive rating (large sample, stable)
+    #
+    # EWMA alpha scales with opponent's PO game count:
+    #   alpha = min(0.60, po_gp / 14 * 0.60)
+    #   → 0 PO games:  purely RS (season anchor dominates)
+    #   → 7 PO games:  ~30% PO, 70% RS
+    #   → 14 PO games: 60% PO, 40% RS (cap — PO never fully crowds out RS)
+    #
+    # Single shift applied at 1%/pt from 112 baseline, sigmoid-capped at ±8%.
+    # Scoring props: full effect. Rebounds/assists: 40% scale.
     # ─────────────────────────────────────────────────────────────────────────
-    matchup_pct = 0.0
-    if prop_type in ("points", "pra", "pa", "pr", "three_pointers") and opp_delta:
-        deff_delta = float(opp_delta.get("dEFF_delta") or 0)
-        # gp check removed — matchup delta now computed vs league avg (season-long),
-        # not rolling L5, so gp is not meaningful as a quality gate.
-        if abs(deff_delta) >= 0.5:
-            matchup_pct = min(_MATCHUP_CAP, max(-_MATCHUP_CAP, deff_delta * _MATCHUP_SCALE))
-            matchup_abs = round(corr * matchup_pct, 2)
-            direction   = "above" if deff_delta > 0 else "below"
-            quality     = "SOFT" if deff_delta > 0 else "ELITE"
-            drivers.append(
-                f"Matchup Quality — {opp_abbr} defense is {quality} "
-                f"({opp_delta.get('l5_dEFF', '?'):.1f} dEFF, "
-                f"{abs(deff_delta):.1f} pts {direction} league avg of "
-                f"{opp_delta.get('season_dEFF', '?'):.1f}). "
-                f"Impact: {matchup_pct*100:+.1f}% ({matchup_abs:+.2f} pts)."
-            )
-    breakdown["matchupAdj"] = round(matchup_pct * 100, 2)
-    corr = round(corr * (1 + matchup_pct), 2)
+    _DEF_COMPOSITE_PROPS = {
+        **{p: 1.0 for p in _SCORING_PROPS},
+        "rebounds": 0.40,
+        "assists":  0.40,
+    }
+    def_composite_pct = 0.0
+    if prop_type in _DEF_COMPOSITE_PROPS and opp_team_data:
+        po_deff_raw  = opp_team_data.get("poDEFF")
+        rs_deff_raw  = opp_team_data.get("rsDEFF")
+        opp_po_gp    = int(opp_team_data.get("poGP") or 0)
+
+        # Need at least RS dEFF to compute anything meaningful
+        if rs_deff_raw:
+            rs_deff = float(rs_deff_raw)
+            # EWMA alpha: 0→0% PO weight, 14→60% PO weight (capped)
+            alpha = min(0.60, opp_po_gp / 14.0 * 0.60) if opp_po_gp > 0 else 0.0
+            if po_deff_raw and alpha > 0:
+                po_deff = float(po_deff_raw)
+                composite_deff = alpha * po_deff + (1.0 - alpha) * rs_deff
+            else:
+                composite_deff = rs_deff   # pre-playoff or no PO data
+
+            _DEF_COMPOSITE_BASELINE = 112.0   # PO league-average dEFF
+            delta_from_baseline = composite_deff - _DEF_COMPOSITE_BASELINE
+            scale = _DEF_COMPOSITE_PROPS[prop_type]
+            raw_shift = delta_from_baseline * (0.01 / 1.0) * scale  # 1% per dEFF point
+            # Sigmoid-capped: ±8% hard headroom (L = 0.096), smooth approach
+            def_composite_pct = _soft_cap(raw_shift, 0.08)
+
+            if abs(def_composite_pct) >= 0.003:
+                grade = ("ELITE"   if composite_deff <= 108 else
+                         "STRONG"  if composite_deff <= 110 else
+                         "AVERAGE" if composite_deff <= 114 else
+                         "WEAK")
+                def_abs    = round(corr * def_composite_pct, 2)
+                prop_label = "scoring" if prop_type in _SCORING_PROPS else prop_type
+                drivers.append(
+                    f"Defense Composite (EWMA) — {opp_abbr} grades {grade} "
+                    f"({composite_deff:.1f} composite dEFF: "
+                    f"{alpha*100:.0f}% PO [{po_deff_raw or 'n/a'}] + "
+                    f"{(1-alpha)*100:.0f}% RS [{rs_deff:.1f}], {prop_label} effect). "
+                    f"Impact: {def_composite_pct*100:+.1f}% ({def_abs:+.2f})."
+                )
+    breakdown["defCompositeAdj"] = round(def_composite_pct * 100, 2)
+    corr = round(corr * (1.0 + def_composite_pct), 2)
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 3 — SHOT PROFILE ALIGNMENT
@@ -1076,7 +1257,7 @@ def post_project():
                                 (tracking_row.get("drebChance") or 0))
         if gp >= 2 and total_chances >= 1.0 and reb_chance_pct > 0:
             rate_vs_league = (reb_chance_pct - _LEAGUE_AVG_REB_CONV) / _LEAGUE_AVG_REB_CONV
-            hustle_pct     = min(0.08, max(-0.08, rate_vs_league * 0.5))
+            hustle_pct     = _soft_cap(rate_vs_league * 0.5, 0.08)   # sigmoid, was hard ±8%
             hustle_delta   = round(corr * hustle_pct, 2)
             if abs(hustle_pct) >= 0.005:
                 direction = "ABOVE" if rate_vs_league > 0 else "BELOW"
@@ -1092,20 +1273,19 @@ def post_project():
     corr = round(corr + hustle_delta, 1)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 5 — PACE CONTEXT (data-verified)
-    # Game pace = (own_team_pace + opp_team_pace) / 2 from teams cache.
-    # League PO baseline: ~96.5 possessions per 48 min.
-    # More possessions = more opportunities for ALL counting stats.
-    # Affects every counting prop linearly. Cap ±5%.
+    # ADJUSTMENT 5 — PACE CONTEXT
+    # When use_rate_base=True, pace is already baked into projected_minutes inside
+    # _base_stat (Rate×Minutes baseline). Firing Adj 5 on top would double-count it.
+    # When use_rate_base=False (per-game fallback), fire normally with sigmoid cap.
     # ─────────────────────────────────────────────────────────────────────────
     pace_pct = 0.0
-    if prop_type in _COUNTING_PROPS:
+    if prop_type in _COUNTING_PROPS and not use_rate_base:
         own_pace = float(own_team_data.get("rsPace") or 0)
         opp_pace = float(opp_team_data.get("rsPace") or 0)
-        if own_pace > 50 and opp_pace > 50:  # sanity-check real values
+        if own_pace > 50 and opp_pace > 50:
             game_pace = round((own_pace + opp_pace) / 2, 1)
             delta_pct = (game_pace - _LEAGUE_AVG_PACE) / _LEAGUE_AVG_PACE
-            pace_pct = min(_PACE_CAP, max(-_PACE_CAP, delta_pct))
+            pace_pct  = _soft_cap(delta_pct, _PACE_CAP)   # sigmoid, was hard ±5%
             if abs(pace_pct) >= 0.005:
                 tempo = "FAST" if delta_pct > 0 else "SLOW"
                 pace_abs = round(corr * pace_pct, 2)
@@ -1114,6 +1294,16 @@ def post_project():
                     f"{_LEAGUE_AVG_PACE} league avg). Each possession = scoring opportunity. "
                     f"Impact: {pace_pct*100:+.1f}% ({pace_abs:+.2f})."
                 )
+    elif use_rate_base and prop_type in _COUNTING_PROPS:
+        # Pace already baked into projected minutes in the baseline
+        own_pace = float(own_team_data.get("rsPace") or 0)
+        opp_pace = float(opp_team_data.get("rsPace") or 0)
+        if own_pace > 50 and opp_pace > 50:
+            game_pace = round((own_pace + opp_pace) / 2, 1)
+            drivers.append(
+                f"Pace Context — {game_pace} possessions/48 already factored into "
+                f"projected minutes (Rate×Minutes baseline active). No separate Adj 5."
+            )
     breakdown["paceAdj"] = round(pace_pct * 100, 2)
     corr = round(corr * (1 + pace_pct), 2)
 
@@ -1213,7 +1403,7 @@ def post_project():
                 other_avg = r if is_home else h
                 avg = (h + r) / 2
                 delta_pct = (venue_avg - other_avg) / avg if avg > 0 else 0
-                splits_pct = min(_SPLIT_CAP, max(-_SPLIT_CAP, delta_pct * _SPLIT_BLEND_WEIGHT))
+                splits_pct = _soft_cap(delta_pct * _SPLIT_BLEND_WEIGHT, _SPLIT_CAP)  # sigmoid, was hard ±6%
                 if abs(splits_pct) >= 0.005:
                     venue = "HOME" if is_home else "ROAD"
                     splits_abs = round(corr * splits_pct, 2)
@@ -1234,23 +1424,34 @@ def post_project():
     #   • divergence is significant (≥20% above/below regular rate)
     # ─────────────────────────────────────────────────────────────────────────
     clutch_delta = 0.0
-    if high_leverage and clutch_row and prop_type in _SCORING_PROPS:
-        c_ppg = float(clutch_row.get("ppg") or 0)
-        c_min = float(clutch_row.get("min") or 0)
-        c_gp  = int(clutch_row.get("gp") or 0)
-        r_ppg = float(po.get("ppg") or rs.get("ppg") or 0)
-        r_min = float(po.get("min") or rs.get("min") or 0)
-        if c_min >= 1.0 and c_gp >= 2 and r_ppg > 0 and r_min > 5:
-            c_per_min = c_ppg / max(c_min, 0.5)
-            r_per_min = r_ppg / max(r_min, 0.5)
+    # Map prop_type → (clutch_key, regular_key, stat_label, abs_cap)
+    _CLUTCH_STAT_MAP = {
+        "points":         ("ppg", "ppg", "pts", 0.6),
+        "pra":            ("ppg", "ppg", "pts", 0.6),
+        "pa":             ("ppg", "ppg", "pts", 0.6),
+        "pr":             ("ppg", "ppg", "pts", 0.6),
+        "three_pointers": ("ppg", "ppg", "pts", 0.6),
+        "rebounds":       ("rpg", "rpg", "reb", 0.4),
+        "assists":        ("apg", "apg", "ast", 0.3),
+    }
+    if high_leverage and clutch_row and prop_type in _CLUTCH_STAT_MAP:
+        c_key, r_key, stat_lbl, abs_cap = _CLUTCH_STAT_MAP[prop_type]
+        c_stat = float(clutch_row.get(c_key) or 0)
+        c_min  = float(clutch_row.get("min") or 0)
+        c_gp   = int(clutch_row.get("gp") or 0)
+        r_stat = float(po.get(r_key) or rs.get(r_key) or 0)
+        r_min  = float(po.get("min") or rs.get("min") or 0)
+        if c_min >= 1.0 and c_gp >= 2 and r_stat > 0 and r_min > 5:
+            c_per_min = c_stat / max(c_min, 0.5)
+            r_per_min = r_stat / max(r_min, 0.5)
             lift = (c_per_min - r_per_min) / r_per_min if r_per_min > 0 else 0
             if abs(lift) >= _CLUTCH_LIFT_THRESH:
-                # Apply 50% of the lift, capped at ±0.6 pts in absolute terms
-                clutch_delta = round(min(0.6, max(-0.6, lift * 0.5)), 2)
+                # Apply 50% of the lift, capped by stat type
+                clutch_delta = round(_soft_cap(lift * 0.5, abs_cap), 2)  # sigmoid, was hard ±abs_cap
                 label = "ELEVATES" if lift > 0 else "SHRINKS"
                 drivers.append(
                     f"Clutch Profile (HIGH-LEVERAGE) — {resolved_name.title()} {label} "
-                    f"in clutch ({c_per_min*36:.1f} pts/36 vs {r_per_min*36:.1f} regular, "
+                    f"in clutch ({c_per_min*36:.1f} {stat_lbl}/36 vs {r_per_min*36:.1f} regular, "
                     f"{c_gp} clutch games). Game-7 boost: {clutch_delta:+.2f}."
                 )
     breakdown["clutchAdj"] = clutch_delta
@@ -1311,7 +1512,7 @@ def post_project():
         if po_v > 0 and rs_v > 0:
             po_lift = (po_v - rs_v) / rs_v
             if abs(po_lift) >= 0.10:  # ≥10% divergence is meaningful
-                elev_pct = min(0.06, max(-0.06, po_lift * 0.30))
+                elev_pct = _soft_cap(po_lift * 0.30, 0.06)  # sigmoid, was hard ±6%
                 elev_abs = round(corr * elev_pct, 2)
                 label = "ELEVATING" if po_lift > 0 else "FADING"
                 drivers.append(
@@ -1324,33 +1525,35 @@ def post_project():
     corr = round(corr * (1 + elev_pct), 2)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 12 — DEFENSIVE MATCHUP TYPE (data-verified, no client context)
-    # For SCORING props, factor in opponent's overall dEFF (separately from
-    # the matchup_delta which uses league-avg comparison). This uses the
-    # blended RS+PO dEFF for the most stable signal.
-    # Elite D (≤108) → -2%; Bad D (≥115) → +2%; cap ±2.5%.
+    # ADJUSTMENT 11b — PLAYOFF DEBUT FACTOR (zero career PO games this season)
+    # Players making their first playoff appearance historically outperform
+    # regular-season lines. Young/role players especially show adrenaline lift.
+    # Observed May 4 2026: Harper +58%, Champagnie +74% vs model in Game 1.
+    # Stars and veterans excluded (handled by Adj 9 clutch + 11 PO form).
+    # Rules:
+    #   • po_gp == 0 (literally no playoff data this season)
+    #   • rs_gp >= 10 (not a garbage-time player)
+    #   • rs stat for this prop > 0 (has something to project from)
+    #   • role player (rs_ppg < 22) — stars already get elite clutch adj
+    #   → +5% lift (modest — one game is not a trend)
     # ─────────────────────────────────────────────────────────────────────────
-    def_match_pct = 0.0
-    if prop_type in _SCORING_PROPS and opp_team_data:
-        opp_deff = opp_team_data.get("dEFF") or opp_team_data.get("rsDEFF")
-        if opp_deff:
-            opp_deff = float(opp_deff)
-            # Center around 112 (typical PO league avg). Apply 1% per 1.5 dEFF point delta.
-            deff_delta_pts = opp_deff - 112.0
-            def_match_pct = min(0.025, max(-0.025, deff_delta_pts * (0.01 / 1.5)))
-            if abs(def_match_pct) >= 0.005:
-                grade = ("ELITE" if opp_deff <= 108 else
-                         "STRONG" if opp_deff <= 110 else
-                         "AVERAGE" if opp_deff <= 114 else
-                         "WEAK")
-                def_abs = round(corr * def_match_pct, 2)
-                drivers.append(
-                    f"Defensive Tier — {opp_abbr} grades {grade} defense "
-                    f"({opp_deff:.1f} dEFF, blended RS+PO). "
-                    f"Impact: {def_match_pct*100:+.1f}% ({def_abs:+.2f})."
-                )
-    breakdown["defMatchAdj"] = round(def_match_pct * 100, 2)
-    corr = round(corr * (1 + def_match_pct), 2)
+    debut_pct = 0.0
+    if po_gp_check == 0 and rs_gp_check >= 10:
+        rs_ppg_for_debut = float(rs.get("ppg") or 0)
+        if 3.0 <= rs_ppg_for_debut < 22.0:
+            debut_pct = 0.05
+            debut_abs = round(corr * debut_pct, 2)
+            drivers.append(
+                f"Playoff Debut — {resolved_name.title()} has 0 career PO games "
+                f"this season ({rs_gp_check} RS games, {rs_ppg_for_debut:.1f} RS PPG). "
+                f"First-game adrenaline lift: {debut_pct*100:+.1f}% ({debut_abs:+.2f})."
+            )
+    breakdown["debutAdj"] = round(debut_pct * 100, 2)
+    corr = round(corr * (1 + debut_pct), 2)
+
+    # NOTE: Old Adj 12 (Defensive Matchup Type) removed — merged into Adj 2
+    # (Defense Composite EWMA). Keeping adjustment number for reference continuity.
+    breakdown["defMatchAdj"] = 0.0   # legacy key — now included in defCompositeAdj
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 13 — INJURY CASCADE (teammate OUT → usage boost; own GTD → penalty)
@@ -1373,33 +1576,48 @@ def post_project():
             f"GTD penalty: {inj_cascade_pct*100:+.1f}% ({inj_abs:+.2f})."
         )
     elif prop_type in _COUNTING_PROPS and own_team:
+        # Determine which stat to track freed production by, threshold, and label
+        _CASCADE_STAT_CFG = {
+            "points":   ("ppg", "ppg", 8.0,  "PPG"),
+            "pra":      ("ppg", "ppg", 8.0,  "PPG"),
+            "pa":       ("ppg", "ppg", 8.0,  "PPG"),
+            "pr":       ("ppg", "ppg", 8.0,  "PPG"),
+            "rebounds": ("rpg", "rpg", 4.0,  "RPG"),
+            "assists":  ("apg", "apg", 3.0,  "APG"),
+            "steals":   ("spg", "spg", 0.5,  "SPG"),
+            "blocks":   ("bpg", "bpg", 0.5,  "BPG"),
+            "three_pointers": ("ppg", "ppg", 8.0, "PPG"),
+        }
+        stat_key, my_stat_key, thresh, stat_lbl = _CASCADE_STAT_CFG.get(
+            prop_type, ("ppg", "ppg", 8.0, "PPG")
+        )
         full_players = (_cache_get("players") or {}).get("players", {})
         teammates_out, remaining_usg = [], 0.0
         for tname, tdata in full_players.items():
             if tdata.get("team") != own_team or tname == resolved_name:
                 continue
-            t_inj = _INJURY_OVERRIDES.get(tname) or {}
-            t_usg = float(tdata.get("po", {}).get("usg") or tdata.get("rs", {}).get("usg") or 0)
-            t_ppg = float(tdata.get("po", {}).get("ppg") or tdata.get("rs", {}).get("ppg") or 0)
-            if t_inj.get("status") == "Out" and t_ppg >= 8.0:
-                teammates_out.append({"name": tname, "ppg": t_ppg, "usg": t_usg})
+            t_inj  = _INJURY_OVERRIDES.get(tname) or {}
+            t_usg  = float(tdata.get("po", {}).get("usg") or tdata.get("rs", {}).get("usg") or 0)
+            t_stat = float(tdata.get("po", {}).get(stat_key) or tdata.get("rs", {}).get(stat_key) or 0)
+            if t_inj.get("status") == "Out" and t_stat >= thresh:
+                teammates_out.append({"name": tname, stat_lbl: t_stat, "usg": t_usg})
             else:
                 remaining_usg += t_usg
         if teammates_out:
-            my_usg  = float(po.get("usg") or rs.get("usg") or 0)
-            pool    = remaining_usg + my_usg
+            my_usg   = float(po.get("usg") or rs.get("usg") or 0)
+            pool     = remaining_usg + my_usg
             if my_usg > 0 and pool > 0:
-                freed   = sum(p["ppg"] for p in teammates_out)
-                share   = my_usg / pool
-                boost   = freed * share
-                my_ppg  = float(po.get("ppg") or rs.get("ppg") or 1)
-                raw_pct = boost / max(my_ppg, 1)
-                inj_cascade_pct = min(0.15, max(0.0, raw_pct))
+                freed    = sum(p[stat_lbl] for p in teammates_out)
+                share    = my_usg / pool
+                boost    = freed * share
+                my_stat  = float(po.get(my_stat_key) or rs.get(my_stat_key) or 1)
+                raw_pct  = boost / max(my_stat, 1)
+                inj_cascade_pct = max(0.0, _soft_cap(raw_pct, 0.15))  # sigmoid, was hard cap +15%
                 if inj_cascade_pct >= 0.01:
-                    boost_abs  = round(corr * inj_cascade_pct, 2)
-                    out_names  = ", ".join(p["name"].title() for p in teammates_out[:3])
+                    boost_abs = round(corr * inj_cascade_pct, 2)
+                    out_names = ", ".join(p["name"].title() for p in teammates_out[:3])
                     drivers.append(
-                        f"Injury Cascade — {out_names} OUT ({freed:.1f} freed PPG). "
+                        f"Injury Cascade — {out_names} OUT ({freed:.1f} freed {stat_lbl}). "
                         f"{resolved_name.title()} absorbs ~{share*100:.0f}% of load "
                         f"(USG {my_usg:.0f}%). Boost: {inj_cascade_pct*100:+.1f}% ({boost_abs:+.2f})."
                     )
@@ -1417,22 +1635,23 @@ def post_project():
     # ─────────────────────────────────────────────────────────────────────────
     residual_pct = 0.0
     residual_n   = min(len(prior_residuals), 20)
-    if residual_n >= 3:
+    if residual_n >= 5:   # need more evidence before adjusting (was 3)
         try:
-            samples = prior_residuals[-10:]   # cap at last 10
+            samples = prior_residuals[-15:]   # use up to last 15 for richer signal
             weighted_errors = []
             for i, r in enumerate(samples):
                 p_val = float(r.get("projected") or 0)
                 a_val = float(r.get("actual")    or 0)
                 if p_val > 0.5:
                     rel_err = (a_val - p_val) / p_val
-                    weight  = (i + 1) ** 0.5  # recency: √(index) — older gets less weight
+                    # Gentle linear recency — old samples still matter (1.0x → 1.0+0.1*i)
+                    weight  = 1.0 + i * 0.1
                     weighted_errors.append((rel_err, weight))
             if weighted_errors:
                 total_w   = sum(w for _, w in weighted_errors)
                 mean_bias = sum(e * w for e, w in weighted_errors) / total_w
-                if abs(mean_bias) >= 0.02:   # only act on meaningful systematic bias
-                    residual_pct = max(-0.12, min(0.12, mean_bias))
+                if abs(mean_bias) >= 0.04:   # 4% threshold — only act on systemic bias
+                    residual_pct = _soft_cap(mean_bias, 0.08)  # sigmoid, was hard ±8%
                     res_abs      = round(corr * residual_pct, 2)
                     direction    = "under" if mean_bias > 0 else "over"
                     drivers.append(
@@ -1480,6 +1699,8 @@ def post_project():
             "has_clutch":     bool(clutch_row),
             "has_pace":       bool(own_team_data and opp_team_data),
             "has_l5":         l5_avg is not None,
+            "has_l5_min":     l5_min is not None,
+            "use_rate_base":  use_rate_base,
             "has_rest":       rest_days is not None,
             "is_home":        is_home,
             "high_leverage":  high_leverage,
@@ -1488,9 +1709,42 @@ def post_project():
 
 
 def _roster_for_team(team_abbr: str) -> list:
-    """Return list of player names from players cache for a given team abbreviation."""
+    """
+    Return player name list for a team.
+    Primary: players stats cache (always current when warm).
+    Fallback: CommonTeamRoster API + per-team cache (handles cold start &
+              new playoff teams not yet in PO stats).
+    """
     players_data = (_cache_get("players") or {}).get("players", {})
-    return [name for name, p in players_data.items() if p.get("team") == team_abbr]
+    names = [name for name, p in players_data.items() if p.get("team") == team_abbr]
+    if names:
+        return names
+
+    # Stats cache miss — try dedicated roster cache first
+    roster_cache_key = f"team_roster_{team_abbr}"
+    cached = _cache_get(roster_cache_key)
+    if cached is not None:
+        return cached
+
+    # Live lookup via CommonTeamRoster
+    team_id = _TEAM_ABBR_TO_ID.get(team_abbr)
+    if not team_id:
+        logging.warning("_roster_for_team: unknown abbr '%s'", team_abbr)
+        return []
+    try:
+        from nba_api.stats.endpoints import commonteamroster
+        time.sleep(0.5)  # gentle rate-limit
+        ep  = commonteamroster.CommonTeamRoster(team_id=str(team_id), season=SEASON)
+        df  = ep.common_team_roster.get_data_frame()
+        col = "PLAYER" if "PLAYER" in df.columns else (df.columns[1] if len(df.columns) > 1 else None)
+        names = [str(n).lower() for n in (df[col].tolist() if col else []) if n]
+        _cache_set(roster_cache_key, names)
+        logging.info("_roster_for_team: CommonTeamRoster fetched %d for %s", len(names), team_abbr)
+        return names
+    except Exception as e:
+        logging.warning("_roster_for_team: CommonTeamRoster failed for %s — %s", team_abbr, e)
+        _cache_set(roster_cache_key, [])   # cache empty to avoid hammering API on repeat calls
+        return []
 
 
 def _fmt_series(home_wins: int, away_wins: int, home_abbr: str, away_abbr: str) -> str:
@@ -1532,8 +1786,9 @@ def _fetch_espn_games(date_yyyymmdd, et_label_for_today=None):
 
             home_team = home.get("team") or {}
             away_team = away.get("team") or {}
-            home_abbr = home_team.get("abbreviation") or ""
-            away_abbr = away_team.get("abbreviation") or ""
+            # Normalize ESPN short abbrs → NBA stats API abbrs (SA→SAS, NY→NYK etc.)
+            home_abbr = _norm_abbr(home_team.get("abbreviation") or "")
+            away_abbr = _norm_abbr(away_team.get("abbreviation") or "")
             home_full = home_team.get("displayName") or home_abbr
             away_full = away_team.get("displayName") or away_abbr
 
@@ -1690,105 +1945,47 @@ def _fetch_date_games(date_str):
 @app.route("/api/schedule")
 def get_schedule():
     """
-    Returns today's games (from live scoreboard) + tomorrow's scheduled games.
-    Always returns 200 with safe empty arrays if NBA APIs fail — never crashes
-    the frontend, which depends on this for game selection.
+    ESPN-only schedule. No NBA stats scoreboard dependency.
+    Tonight  = ESPN games for the game-night display date.
+    Upcoming = ESPN games for the next date that has games.
+    Game-night date: before 6 AM ET use yesterday (games ran past midnight).
     """
     try:
-        ET = timezone(timedelta(hours=-4))   # EDT (Apr–Oct)
-        now_et = datetime.now(ET)
-        today_label    = now_et.strftime(f"%b {now_et.day}, %Y")
-        tomorrow_et    = now_et + timedelta(days=1)
-        tomorrow_label = tomorrow_et.strftime(f"%b {tomorrow_et.day}")
-        today_str      = now_et.strftime("%m/%d/%Y")
-        tomorrow_str   = tomorrow_et.strftime("%m/%d/%Y")
+        ET       = timezone(timedelta(hours=-4))
+        now_et   = datetime.now(ET)
+        # Game-night rollback: before 6 AM, last night is still "tonight"
+        display_et    = now_et if now_et.hour >= 6 else (now_et - timedelta(days=1))
+        today_iso     = display_et.strftime("%Y%m%d")
+        today_label   = display_et.strftime(f"%b {display_et.day}, %Y")
+        upcoming_base = display_et + timedelta(days=1)
+        logging.info("Schedule: display_et=%s now_et=%s", display_et.date(), now_et.date())
     except Exception as e:
-        logging.error("Schedule date computation failed: %s", e)
-        return jsonify({
-            "success": True, "today": "Today", "upcomingLabel": "Tomorrow",
-            "games": [], "todayGames": [], "upcomingGames": [],
-        })
+        logging.error("Schedule date setup failed: %s", e)
+        return jsonify({"success": True, "today": "Today", "upcomingLabel": "Tomorrow",
+                        "games": [], "todayGames": [], "upcomingGames": []})
 
-    # ── Today: try live scoreboard first ───────────────────────────────────
-    today_games = []
-    try:
-        board = live_scoreboard.ScoreBoard()
-        try:
-            game_dicts = board.games.get_dict()
-        except Exception:
-            game_dicts = []
-        for g in (game_dicts or []):
-            try:
-                away = g.get("awayTeam") or {}
-                home = g.get("homeTeam") or {}
-                home_abbr = home.get("teamTricode") or ""
-                away_abbr = away.get("teamTricode") or ""
-                entry = {
-                    "id":        g.get("gameId") or "",
-                    "away":      away_abbr,
-                    "home":      home_abbr,
-                    "awayTeam":  away.get("teamName") or away_abbr,
-                    "homeTeam":  home.get("teamName") or home_abbr,
-                    "time":      g.get("gameStatusText") or "TBD",
-                    "title":     "Playoff Game",
-                    "series":    "",
-                    "restDays":  {},
-                    "awayScore": away.get("score"),
-                    "homeScore": home.get("score"),
-                    "period":    g.get("period"),
-                }
-                if home_abbr: entry[home_abbr] = _roster_for_team(home_abbr)
-                if away_abbr: entry[away_abbr] = _roster_for_team(away_abbr)
-                today_games.append(entry)
-            except Exception as e:
-                logging.warning("Skipping malformed live game: %s", e)
-                continue
-    except Exception as e:
-        logging.error("Live scoreboard error: %s", e)
+    # Tonight — ESPN for the game-night date (date-keyed, not clock-keyed)
+    today_games = _fetch_espn_games(today_iso)
+    logging.info("Tonight (%s): %d games", today_iso, len(today_games))
 
-    # ── If live scoreboard returned nothing, try ESPN, then NBA stats API ──
-    if not today_games:
-        today_iso = now_et.strftime("%Y%m%d")
-        today_games = _fetch_espn_games(today_iso)
-    if not today_games:
-        try:
-            today_games = _fetch_date_games(today_str)
-        except Exception as e:
-            logging.warning("Today stats scoreboard fallback failed: %s", e)
-            today_games = []
-
-    # ── Upcoming: scan next 4 days; prefer ESPN (has conditional Game 7s) ──
-    # ESPN posts the playoff schedule including conditional Game 7s well before
-    # NBA stats API officially confirms them. Falls back to NBA stats API.
+    # Upcoming — first date after game-night date that has ESPN games
     upcoming_games = []
-    upcoming_date  = tomorrow_str
-    upcoming_label = tomorrow_label
-    for offset in range(1, 5):
-        d = now_et + timedelta(days=offset)
-        ds_us  = d.strftime("%m/%d/%Y")
+    upcoming_label = upcoming_base.strftime(f"%b {upcoming_base.day}")
+    for offset in range(0, 6):
+        d      = upcoming_base + timedelta(days=offset)
         ds_iso = d.strftime("%Y%m%d")
-        # 1. Try ESPN first (best for conditional/predicted games)
-        games = _fetch_espn_games(ds_iso)
-        # 2. Fall back to NBA stats API
-        if not games:
-            try:
-                games = _fetch_date_games(ds_us)
-            except Exception as e:
-                logging.warning("NBA stats fallback failed for %s: %s", ds_us, e)
-                games = []
+        games  = _fetch_espn_games(ds_iso)
         if games:
             upcoming_games = games
-            upcoming_date  = ds_us
             upcoming_label = d.strftime(f"%b {d.day}")
-            logging.info("Upcoming games found for %s: %d", ds_us, len(games))
+            logging.info("Upcoming (%s): %d games", ds_iso, len(games))
             break
 
     return jsonify({
         "success":       True,
         "today":         today_label,
-        "todayDate":     today_str,
+        "todayDate":     today_iso,
         "upcomingLabel": upcoming_label,
-        "upcomingDate":  upcoming_date,
         "games":         today_games,
         "todayGames":    today_games,
         "upcomingGames": upcoming_games,
