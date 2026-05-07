@@ -22,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.6-perf"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.7-espn-fix"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2539,27 +2539,32 @@ def _build_effective_injury_map():
             "live_playing": 0, "auto_cleared": [], "gtd_softened": []}
 
     # ── Layer 1: ESPN live injury feed (broadest coverage) ────────────────────
+    # ESPN returns a nested structure: injuries[] is an array of TEAM objects,
+    # each with its own injuries[] array of player entries.
+    # Player detail: entry.athlete.displayName / .team.abbreviation
+    # Status detail: entry.shortComment (concise) or entry.longComment (verbose)
     try:
         url = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=6) as resp:
+        with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        for entry in (data.get("injuries") or []):
-            try:
-                athlete   = entry.get("athlete") or {}
-                name      = (athlete.get("displayName") or "").strip().lower()
-                status    = (entry.get("status") or "").strip()
-                team_info = (athlete.get("team") or {})
-                team      = team_info.get("abbreviation", "")
-                det       = entry.get("details") or {}
-                detail    = det.get("detail") or det.get("type") or status
-                if name and status:
-                    merged[name] = {"status": status, "detail": detail,
-                                    "team": team, "source": "espn_live"}
-            except Exception:
-                continue
+        for team_entry in (data.get("injuries") or []):
+            for entry in (team_entry.get("injuries") or []):
+                try:
+                    athlete   = entry.get("athlete") or {}
+                    name      = (athlete.get("displayName") or "").strip().lower()
+                    status    = (entry.get("status") or "").strip()
+                    team_info = (athlete.get("team") or {})
+                    team      = _norm_abbr(team_info.get("abbreviation", ""))
+                    detail    = (entry.get("shortComment") or
+                                 entry.get("longComment") or status)
+                    if name and status:
+                        merged[name] = {"status": status, "detail": detail,
+                                        "team": team, "source": "espn_live"}
+                except Exception:
+                    continue
         diag["espn_loaded"] = len(merged)
-        logging.info("ESPN injuries: loaded %d", len(merged))
+        logging.info("ESPN injuries: loaded %d entries from nested feed", len(merged))
     except Exception as e:
         logging.warning("ESPN injury fetch failed: %s", e)
 
