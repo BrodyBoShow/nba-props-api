@@ -2809,20 +2809,82 @@ def _game_log_avg(df):
 
 
 def _game_log_array(df):
-    """Per-game stat array (newest first) — feeds confidence band variance calc."""
+    """Per-game stat array (newest first) — feeds confidence band + residual auto-fill."""
+    def _pct_val(v):
+        try:
+            return round(float(v) * 100, 1) if v is not None and not pd.isna(v) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
     out = []
     for _, row in df.iterrows():
         out.append({
-            "pts":  _f(row.get("PTS")  or 0),
-            "reb":  _f(row.get("REB")  or 0),
-            "ast":  _f(row.get("AST")  or 0),
-            "stl":  _f(row.get("STL")  or 0),
-            "blk":  _f(row.get("BLK")  or 0),
-            "fg3m": _f(row.get("FG3M") or 0),
-            "min":  _f(_parse_min(row.get("MIN"))),
-            "date": str(row.get("GAME_DATE") or ""),
+            # Core counting stats
+            "pts":     _f(row.get("PTS")  or 0),
+            "reb":     _f(row.get("REB")  or 0),
+            "ast":     _f(row.get("AST")  or 0),
+            "stl":     _f(row.get("STL")  or 0),
+            "blk":     _f(row.get("BLK")  or 0),
+            "tov":     _f(row.get("TOV")  or 0),
+            "oreb":    _f(row.get("OREB") or 0),
+            "dreb":    _f(row.get("DREB") or 0),
+            # Shooting splits (stored as pct, e.g. 53.3)
+            "fg_pct":  _pct_val(row.get("FG_PCT")),
+            "fg3_pct": _pct_val(row.get("FG3_PCT")),
+            "ft_pct":  _pct_val(row.get("FT_PCT")),
+            # Raw makes/attempts
+            "fgm":     _f(row.get("FGM")  or 0),
+            "fga":     _f(row.get("FGA")  or 0),
+            "fg3m":    _f(row.get("FG3M") or 0),
+            "fg3a":    _f(row.get("FG3A") or 0),
+            "ftm":     _f(row.get("FTM")  or 0),
+            "fta":     _f(row.get("FTA")  or 0),
+            # Game context
+            "pm":      _f(row.get("PLUS_MINUS") or 0),
+            "min":     _f(_parse_min(row.get("MIN"))),
+            "wl":      str(row.get("WL")       or ""),
+            "matchup": str(row.get("MATCHUP")  or ""),
+            "date":    str(row.get("GAME_DATE") or ""),
         })
     return out
+
+
+@app.route("/api/box-results/<int:player_id>")
+@app.route("/api/box-results/<int:player_id>/<date_str>")
+def get_box_results(player_id, date_str=None):
+    """
+    Full per-game box score for residual auto-fill.
+    Reuses the /api/recent cache when the entry already has extended fields (fg_pct, matchup).
+    Falls back to a fresh PlayerGameLog fetch otherwise.
+    """
+    def _find(gl, ds):
+        if ds:
+            return next((g for g in gl if g.get("date", "").startswith(ds)), None)
+        return gl[0] if gl else None
+
+    # Try cache first
+    cached = _cache_get(f"recent_{player_id}")
+    gl_cached = (cached or {}).get("gameLog", [])
+    game = _find(gl_cached, date_str)
+    if game and "fg_pct" in game:  # extended format present
+        return jsonify({"success": True, "game": game, "source": "cache"})
+
+    # Fetch fresh — grab all PO games so older dates are reachable
+    _sleep()
+    try:
+        logs = playergamelog.PlayerGameLog(
+            player_id=player_id, season=SEASON, season_type_all_star="Playoffs",
+        ).get_data_frames()[0]
+        if logs.empty:
+            return jsonify({"success": False, "error": "no playoff games found"}), 404
+        gl_full = _game_log_array(logs)
+        game = _find(gl_full, date_str)
+        if not game:
+            label = f" on {date_str}" if date_str else ""
+            return jsonify({"success": False, "error": f"no game found{label}"}), 404
+        return jsonify({"success": True, "game": game, "source": "fresh"})
+    except Exception as e:
+        logging.error("box-results error pid=%s: %s", player_id, e)
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/recent/<int:player_id>")
