@@ -22,7 +22,7 @@ import json
 import urllib.request
 import urllib.error
 
-SERVER_VERSION = "v6.3-mc"  # +Monte Carlo (10K bootstrap sims)
+SERVER_VERSION = "v6.4-ctx"  # +context-aware Adj 14 residual bucketing
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1206,7 +1206,8 @@ def post_project():
     is_home      = body.get("is_home")       # bool: player playing at home?
     high_leverage = bool(body.get("high_leverage"))  # Game 7, elimination, etc.
     # Residual calibration — client sends stored projection/actual pairs from localStorage
-    prior_residuals = body.get("prior_residuals") or []   # [{projected, actual, date}, ...]
+    prior_residuals = body.get("prior_residuals") or []   # [{projected, actual, date, ctx?}, ...]
+    current_ctx     = body.get("current_ctx") or {}       # {home, po, b2b, leverage, out: [names]}
 
     if not player_name:
         return jsonify({"success": False, "error": "player_name is required"}), 400
@@ -1807,20 +1808,82 @@ def post_project():
 
     # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 14 — RESIDUAL CALIBRATION (model learns from historical errors)
-    # Client sends prior_residuals: [{projected, actual, date}] stored in localStorage.
+    # Client sends prior_residuals: [{projected, actual, date, ctx?}].
     # Computes weighted mean bias (actual - projected / projected) and corrects it.
-    # Recent samples weighted more heavily (sqrt-scale). Requires ≥3 samples.
-    # Cap ±12% — prevents overfitting on small samples. Only fires if bias ≥2%.
-    # This is what separates a static model from a learning one — no hallucinations,
-    # only hard numerical residuals from real game outcomes the user logged.
+    #
+    # CONTEXT-AWARE BUCKETING (v6.4):
+    #   When residuals carry `ctx` metadata, score each one's similarity to the
+    #   current game's context. If we have ≥3 context-similar samples, use ONLY
+    #   those (more accurate calibration); else fall back to global mean.
+    #
+    # Why: if the model over-projects road games but is dead-on at home, a
+    # global average dilutes both signals. Bucketing applies the right
+    # correction only when conditions match.
+    #
+    # Similarity scoring (max ~6.0):
+    #   home match    +1.5
+    #   po match      +1.5
+    #   b2b match     +1.0
+    #   leverage match +1.0
+    #   teammate-OUT overlap +1.0 per match (capped 2.0)
+    # Threshold for "similar context" = 2.5 → at least 2 strong matches
     # ─────────────────────────────────────────────────────────────────────────
-    residual_pct = 0.0
-    residual_n   = min(len(prior_residuals), 20)
-    if residual_n >= 5:   # need more evidence before adjusting (was 3)
+
+    def _ctx_similarity(sample_ctx, cur_ctx):
+        """Returns 0..6.0 score; higher = more similar context."""
+        if not isinstance(sample_ctx, dict) or not isinstance(cur_ctx, dict):
+            return 0.0
+        s = 0.0
+        if sample_ctx.get("home") is not None and cur_ctx.get("home") is not None \
+                and bool(sample_ctx["home"]) == bool(cur_ctx["home"]):
+            s += 1.5
+        if sample_ctx.get("po") is not None and cur_ctx.get("po") is not None \
+                and bool(sample_ctx["po"]) == bool(cur_ctx["po"]):
+            s += 1.5
+        if sample_ctx.get("b2b") is not None and cur_ctx.get("b2b") is not None \
+                and bool(sample_ctx["b2b"]) == bool(cur_ctx["b2b"]):
+            s += 1.0
+        if sample_ctx.get("leverage") is not None and cur_ctx.get("leverage") is not None \
+                and bool(sample_ctx["leverage"]) == bool(cur_ctx["leverage"]):
+            s += 1.0
+        s_out = set((sample_ctx.get("out") or []))
+        c_out = set((cur_ctx.get("out") or []))
+        if s_out and c_out:
+            overlap = len(s_out & c_out)
+            s += min(2.0, overlap * 1.0)
+        return s
+
+    residual_pct  = 0.0
+    residual_n    = min(len(prior_residuals), 20)
+    bucket_used   = "none"
+    bucket_n      = 0
+    SIM_THRESHOLD = 2.5
+
+    if residual_n >= 5:   # need ≥5 total samples before any calibration fires
         try:
-            samples = prior_residuals[-15:]   # use up to last 15 for richer signal
+            samples = prior_residuals[-15:]   # pool the last 15 for richer signal
+
+            # Bucket: split samples into context-similar vs the rest
+            context_similar = []
+            if current_ctx:
+                for r in samples:
+                    sim = _ctx_similarity(r.get("ctx"), current_ctx)
+                    if sim >= SIM_THRESHOLD:
+                        context_similar.append(r)
+
+            # Choose which pool to calibrate from:
+            #   - ≥3 context-similar → use those (sharper signal)
+            #   - else use global pool (current behavior, backward compat)
+            if len(context_similar) >= 3:
+                pool = context_similar
+                bucket_used = "context_similar"
+            else:
+                pool = samples
+                bucket_used = "global"
+            bucket_n = len(pool)
+
             weighted_errors = []
-            for i, r in enumerate(samples):
+            for i, r in enumerate(pool):
                 p_val = float(r.get("projected") or 0)
                 a_val = float(r.get("actual")    or 0)
                 if p_val > 0.5:
@@ -1835,16 +1898,19 @@ def post_project():
                     residual_pct = _soft_cap(mean_bias, 0.08)  # sigmoid, was hard ±8%
                     res_abs      = round(corr * residual_pct, 2)
                     direction    = "under" if mean_bias > 0 else "over"
+                    bucket_label = "context-matched" if bucket_used == "context_similar" else "global"
                     drivers.append(
-                        f"Residual Learning ({residual_n} game sample) — model has "
-                        f"historically {direction}-projected this prop by "
-                        f"{abs(mean_bias)*100:.1f}%. "
+                        f"Residual Learning ({bucket_n}/{residual_n} {bucket_label} samples) — "
+                        f"model has historically {direction}-projected this prop by "
+                        f"{abs(mean_bias)*100:.1f}% under similar conditions. "
                         f"Calibration: {residual_pct*100:+.1f}% ({res_abs:+.2f})."
                     )
         except (TypeError, ValueError, ZeroDivisionError) as e:
             logging.warning("Residual calibration error: %s", e)
     breakdown["residualCalibAdj"] = round(residual_pct * 100, 2)
     breakdown["residualN"]        = residual_n
+    breakdown["residualBucket"]   = bucket_used     # "none" | "context_similar" | "global"
+    breakdown["residualBucketN"]  = bucket_n
     corr = round(corr * (1 + residual_pct), 2)
 
     # ── No signal found ───────────────────────────────────────────────────────
