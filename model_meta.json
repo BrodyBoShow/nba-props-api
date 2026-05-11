@@ -4,7 +4,6 @@
     "l5_reb",
     "l5_ast",
     "l5_min",
-    "l5_usg",
     "l5_ts",
     "l10_pts_std",
     "l10_min_std",
@@ -23,7 +22,6 @@
     "l5_reb": 3.6,
     "l5_ast": 1.8,
     "l5_min": 24.2,
-    "l5_usg": 7.4,
     "l5_ts": 0.5703488372093024,
     "l10_pts_std": 5.125101625008675,
     "l10_min_std": 5.344779384283945,
@@ -39,24 +37,24 @@
   },
   "validation_results": {
     "pts": {
-      "rmse": 6.106770069851587,
-      "mae": 4.676817893981934,
-      "within_3": 0.4101764496901275,
-      "best_iteration": 351,
+      "rmse": 6.111570622286173,
+      "mae": 4.680390357971191,
+      "within_3": 0.4082027395097304,
+      "best_iteration": 435,
       "model_file": "xgb_pts_model.json"
     },
     "reb": {
-      "rmse": 2.54031697901095,
-      "mae": 1.9232009649276733,
-      "within_3": 0.8041290016973908,
-      "best_iteration": 345,
+      "rmse": 2.5411599284664192,
+      "mae": 1.9228501319885254,
+      "within_3": 0.804602692140686,
+      "best_iteration": 437,
       "model_file": "xgb_reb_model.json"
     },
     "ast": {
-      "rmse": 1.835826139928041,
-      "mae": 1.3546844720840454,
-      "within_3": 0.905696127580626,
-      "best_iteration": 386,
+      "rmse": 1.8377712101506989,
+      "mae": 1.3551318645477295,
+      "within_3": 0.9057750759878419,
+      "best_iteration": 358,
       "model_file": "xgb_ast_model.json"
     }
   },

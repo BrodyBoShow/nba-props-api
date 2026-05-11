@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.7-xgb-fga-fix"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.9.8-xgb-clean-features"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1350,14 +1350,7 @@ def _build_xgb_features(
         if ts is not None:
             l5_ts = float(ts)
 
-    # l5_usg = FGA per game (training feature = FGA from game log).
-    # Estimate from po TS% and pts: FGA ≈ pts / (2 * TS%).
-    # po.get("ts") is the season TS% (0–1 scale), po.get("pts") is PPG.
-    l5_usg = None
-    po_ts  = po.get("ts") or rs.get("ts")
-    po_pts = l5_pts or float(po.get("pts") or 0)
-    if po_ts and po_ts > 0.2 and po_pts:
-        l5_usg = round(po_pts / (2 * float(po_ts)), 1)
+    # l5_usg removed from feature set — FGA not reliably available at inference.
 
     # L10 volatility — std of the L5 values passed by client
     l10_pts_std = None
@@ -1399,7 +1392,6 @@ def _build_xgb_features(
         "l5_reb":        l5_reb,
         "l5_ast":        l5_ast,
         "l5_min":        l5_min_v,
-        "l5_usg":        l5_usg,
         "l5_ts":         l5_ts,
         "l10_pts_std":   l10_pts_std,
         "l10_min_std":   l10_min_std,

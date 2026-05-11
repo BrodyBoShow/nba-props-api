@@ -106,12 +106,11 @@ def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
 
     # L5 rolling averages (prior games only)
     for col, feat in [
-        ("PTS",      "l5_pts"),
-        ("REB",      "l5_reb"),
-        ("AST",      "l5_ast"),
-        ("MIN",      "l5_min"),
-        ("usg_prox", "l5_usg"),
-        ("ts_pct",   "l5_ts"),
+        ("PTS",    "l5_pts"),
+        ("REB",    "l5_reb"),
+        ("AST",    "l5_ast"),
+        ("MIN",    "l5_min"),
+        ("ts_pct", "l5_ts"),
     ]:
         grp[feat] = _rolling_prior(grp[col], 5)
 
@@ -169,10 +168,9 @@ def main():
     # Venue
     raw["is_home"] = raw["MATCHUP"].str.contains(r"vs\.", na=False).astype(int)
 
-    # Per-game TS% and FGA (replaces usg_prox — FGA available at inference via scoring cache)
+    # Per-game TS% only — usg_prox removed (FGA not cleanly available at inference)
     denom = 2 * (raw["FGA"] + 0.44 * raw["FTA"])
-    raw["ts_pct"]   = np.where(denom > 0, raw["PTS"] / denom, np.nan)
-    raw["usg_prox"] = raw["FGA"]   # FGA per game — simpler, inference-compatible
+    raw["ts_pct"] = np.where(denom > 0, raw["PTS"] / denom, np.nan)
 
     # ── 3. Build opponent defensive efficiency proxy ───────────────────────────
     # Aggregate player logs to team totals per game
@@ -224,7 +222,7 @@ def main():
         "season", "season_type",
         # Pre-game features
         "is_home", "rest_days",
-        "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_usg", "l5_ts",
+        "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_ts",
         "l10_pts_std", "l10_min_std",
         "std_pts", "std_reb", "std_ast", "std_min",
         "gp_prior",
@@ -251,7 +249,7 @@ def main():
 
     # Save feature column list and median imputation values for inference
     feature_cols = [
-        "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_usg", "l5_ts",
+        "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_ts",
         "l10_pts_std", "l10_min_std",
         "std_pts", "std_reb", "std_ast", "std_min",
         "gp_prior", "is_home", "rest_days",

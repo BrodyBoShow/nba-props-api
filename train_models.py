@@ -36,7 +36,7 @@ TRAIN_SEASONS  = ["2022-23", "2023-24"]
 VAL_SEASONS    = ["2024-25"]
 
 FEATURE_COLS = [
-    "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_usg", "l5_ts",
+    "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_ts",
     "l10_pts_std", "l10_min_std",
     "std_pts", "std_reb", "std_ast", "std_min",
     "gp_prior", "is_home", "rest_days",
