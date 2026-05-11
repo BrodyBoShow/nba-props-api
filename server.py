@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.5-xgb-sklearn"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.9.6-xgb-guardrail"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1350,12 +1350,11 @@ def _build_xgb_features(
         if ts is not None:
             l5_ts = float(ts)
 
-    # L5 usage proxy from tracking (USG% direct if available)
+    # l5_usg intentionally left None — training used raw usage proxy
+    # (FGA + 0.44*FTA + TOV per game, range 5-25) but inference only has
+    # USG% (0-1 scale), which causes catastrophic feature drift.
+    # Model will impute training median (~10). Retrain needed with FGA-based feature.
     l5_usg = None
-    if tracking_row:
-        usg = tracking_row.get("usgPct") or tracking_row.get("usg_pct")
-        if usg is not None:
-            l5_usg = float(usg)
 
     # L10 volatility — std of the L5 values passed by client
     l10_pts_std = None
@@ -1516,17 +1515,28 @@ def post_project():
             xgb_pred = _xgb_predict(_xgb_prop_key, feats)
             if xgb_pred is not None and xgb_pred > 0:
                 ev_vs_base = round((xgb_pred / base - 1) * 100, 1) if base else 0
-                corr = xgb_pred
-                _xgb_used = True
-                drivers.append(
-                    f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred}) "
-                    f"replaces heuristic multiplier cascade. "
-                    f"Δ vs historical base: {ev_vs_base:+.1f}% "
-                    f"(l5={feats.get('l5_pts') or feats.get('l5_reb') or feats.get('l5_ast'):.1f}, "
-                    f"opp_def={feats.get('opp_def_roll10') or '?'})."
-                )
-                breakdown["xgb_base"] = xgb_pred
-                breakdown["xgb_vs_heuristic_pct"] = ev_vs_base
+                # Guardrail: reject XGBoost if it deviates >35% from historical base.
+                # Extreme deviation signals feature drift (e.g. wrong-scale inputs).
+                if base and abs(ev_vs_base) > 35:
+                    logging.warning(
+                        "XGBoost prediction %.2f rejected — %.1f%% deviation from base %.2f",
+                        xgb_pred, ev_vs_base, base,
+                    )
+                    breakdown["xgb_rejected"] = True
+                    breakdown["xgb_rejection_reason"] = f"deviation {ev_vs_base:+.1f}% exceeds ±35% guardrail"
+                else:
+                    corr = xgb_pred
+                    _xgb_used = True
+                    l5_display = feats.get("l5_pts") or feats.get("l5_reb") or feats.get("l5_ast")
+                    drivers.append(
+                        f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred}) "
+                        f"replaces heuristic multiplier cascade. "
+                        f"Δ vs historical base: {ev_vs_base:+.1f}% "
+                        f"(l5={l5_display:.1f if l5_display else '?'}, "
+                        f"opp_def={feats.get('opp_def_roll10') or '?'})."
+                    )
+                    breakdown["xgb_base"] = xgb_pred
+                    breakdown["xgb_vs_heuristic_pct"] = ev_vs_base
         except Exception as _xe:
             logging.warning("XGBoost inference error: %s", _xe)
     breakdown["xgb_active"] = _xgb_used
