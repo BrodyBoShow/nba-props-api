@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.1-xgb-inference"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.9.2-xgb-pinned"  # +ESPN/vs-opp caching, dynamic TTL by hour
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -118,13 +118,18 @@ def _load_xgb_models():
     for prop in ("pts", "reb", "ast"):
         model_path = os.path.join(os.path.dirname(__file__), f"xgb_{prop}_model.json")
         if not os.path.exists(model_path):
+            logging.warning("XGB model file missing: %s", model_path)
             continue
-        m = _xgb_lib.XGBRegressor()
-        m.load_model(model_path)
-        _XGB_MODELS[prop] = m
-        loaded.append(prop)
+        try:
+            m = _xgb_lib.XGBRegressor()
+            m.load_model(model_path)
+            _XGB_MODELS[prop] = m
+            loaded.append(prop)
+        except Exception as e:
+            logging.error("XGB %s model load failed: %s", prop, e)
 
-    logging.info("XGBoost models loaded: %s", loaded or "none")
+    logging.info("XGBoost models loaded: %s (xgb v%s)",
+                 loaded or "none", getattr(_xgb_lib, "__version__", "?"))
 
 
 def _dynamic_ttl(base_seconds=3600):

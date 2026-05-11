@@ -1,4 +1,4 @@
 flask
 flask-cors
 nba_api
-xgboost
+xgboost==3.2.0
