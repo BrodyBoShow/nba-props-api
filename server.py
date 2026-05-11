@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.8-xgb-clean-features"  # +ESPN/vs-opp caching, dynamic TTL by hour
+SERVER_VERSION = "v6.9.9-xgb-debug"  # +xgb debug fields to diagnose guardrail
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1519,6 +1519,9 @@ def post_project():
                     )
                     breakdown["xgb_rejected"] = True
                     breakdown["xgb_rejection_reason"] = f"deviation {ev_vs_base:+.1f}% exceeds ±35% guardrail"
+                    breakdown["xgb_raw_pred"] = round(xgb_pred, 3)
+                    breakdown["xgb_base_used"] = round(base, 3) if base else None
+                    breakdown["xgb_features_debug"] = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in feats.items()}
                 else:
                     corr = xgb_pred
                     _xgb_used = True
