@@ -31,7 +31,7 @@ except ImportError:
     _xgb_lib      = None
     _XGB_AVAILABLE = False
 
-SERVER_VERSION = "v6.9.10-xgb-cache-keys"  # fix ppg/rpg/apg key names in XGB feature builder
+SERVER_VERSION = "v6.9.11-xgb-fstring-fix"  # fix bad fstring format spec crashing xgb driver
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1527,14 +1527,15 @@ def post_project():
                     corr = xgb_pred
                     _xgb_used = True
                     l5_display = feats.get("l5_pts") or feats.get("l5_reb") or feats.get("l5_ast")
+                    l5_str = f"{l5_display:.1f}" if l5_display else "?"
+                    opp_str = feats.get("opp_def_roll10") or "?"
                     drivers.append(
-                        f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred}) "
+                        f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred:.1f}) "
                         f"replaces heuristic multiplier cascade. "
-                        f"Δ vs historical base: {ev_vs_base:+.1f}% "
-                        f"(l5={l5_display:.1f if l5_display else '?'}, "
-                        f"opp_def={feats.get('opp_def_roll10') or '?'})."
+                        f"Delta vs historical base: {ev_vs_base:+.1f}% "
+                        f"(l5={l5_str}, opp_def={opp_str})."
                     )
-                    breakdown["xgb_base"] = xgb_pred
+                    breakdown["xgb_base"] = round(xgb_pred, 2)
                     breakdown["xgb_vs_heuristic_pct"] = ev_vs_base
         except Exception as _xe:
             logging.warning("XGBoost inference error: %s", _xe)
