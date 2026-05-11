@@ -1350,11 +1350,18 @@ def _build_xgb_features(
         if ts is not None:
             l5_ts = float(ts)
 
-    # l5_usg intentionally left None — training used raw usage proxy
-    # (FGA + 0.44*FTA + TOV per game, range 5-25) but inference only has
-    # USG% (0-1 scale), which causes catastrophic feature drift.
-    # Model will impute training median (~10). Retrain needed with FGA-based feature.
+    # l5_usg = FGA per game (after retrain with FGA-based feature).
+    # Use scoring_row fga if available, else estimate from pts and TS%.
     l5_usg = None
+    if scoring_row:
+        fga = scoring_row.get("fga") or scoring_row.get("fgaPerGame")
+        if fga is not None:
+            l5_usg = float(fga)
+    if l5_usg is None and l5_pts and l5_ts and l5_ts > 0:
+        # Rough estimate: pts ≈ 2 * TS% * FGA  →  FGA ≈ pts / (2 * TS%)
+        ts_frac = l5_ts / 100.0 if l5_ts > 1 else l5_ts
+        if ts_frac > 0.2:
+            l5_usg = round(l5_pts / (2 * ts_frac), 1)
 
     # L10 volatility — std of the L5 values passed by client
     l10_pts_std = None

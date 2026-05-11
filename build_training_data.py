@@ -169,10 +169,10 @@ def main():
     # Venue
     raw["is_home"] = raw["MATCHUP"].str.contains(r"vs\.", na=False).astype(int)
 
-    # Per-game TS% and usage proxy
+    # Per-game TS% and FGA (replaces usg_prox — FGA available at inference via scoring cache)
     denom = 2 * (raw["FGA"] + 0.44 * raw["FTA"])
     raw["ts_pct"]   = np.where(denom > 0, raw["PTS"] / denom, np.nan)
-    raw["usg_prox"] = raw["FGA"] + 0.44 * raw["FTA"] + raw["TOV"]
+    raw["usg_prox"] = raw["FGA"]   # FGA per game — simpler, inference-compatible
 
     # ── 3. Build opponent defensive efficiency proxy ───────────────────────────
     # Aggregate player logs to team totals per game
