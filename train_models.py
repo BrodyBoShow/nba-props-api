@@ -5,9 +5,14 @@ Train XGBoost regressors for points, rebounds, and assists.
 
 Per prop, trains FOUR parallel models:
   • Poisson median  — primary point estimate (corr base)
-  • q=0.25          — lower bound / floor
-  • q=0.50          — true median via quantile loss (fair-line extraction)
-  • q=0.75          — upper bound / ceiling
+  • q=0.25          — RESIDUAL lower bound (offset from Poisson, not absolute)
+  • q=0.50          — RESIDUAL median offset (blended 50/50 with Poisson at inference)
+  • q=0.75          — RESIDUAL upper bound (offset from Poisson, not absolute)
+
+Quantile models predict the residual error (actual − Poisson) rather than the
+raw target. At inference, add the offset onto the final adjusted projection
+(post Adj-13 injury cascade + Adj-14 residual calibration) so bands widen
+correctly when injury scratches push the base up.
 
 Strict chronological split — train on older seasons, validate on the most
 recent season only. This mirrors actual sportsbook conditions.
@@ -157,16 +162,27 @@ def main():
             "model_file": model_file,
         }
 
-        # ── Quantile models (q25 / q50 / q75) ────────────────────────────────
-        print(f"\n  Training quantile models (q25/q50/q75)…")
+        # ── Residual Quantile models (q25 / q50 / q75) ───────────────────────
+        # Train quantile models to predict the RESIDUAL ERROR (actual - poisson),
+        # not the raw target. During inference, add the offset onto the final
+        # adjusted projection (after Adj 13 injury cascade + Adj 14 residual cal).
+        # This means bands correctly widen when teammate scratches push base up.
+        print(f"\n  Training residual quantile models (q25/q50/q75)…")
+        train_resid = y_train - model.predict(X_train)   # residuals on train set
+        val_resid   = y_val   - model.predict(X_val)     # residuals on val set
+
         for alpha in QUANTILES:
             tag = f"q{int(alpha*100)}"
-            qmodel = _train_quantile(X_train, y_train, X_val, y_val, alpha, prop)
-            qpreds = qmodel.predict(X_val).clip(min=0)
-            qmae   = float(mean_absolute_error(y_val, qpreds))
-            qfile  = f"xgb_{prop}_{tag}.json"
+            qmodel = _train_quantile(X_train, train_resid, X_val, val_resid, alpha, prop)
+
+            # Evaluate: apply offset to Poisson preds, compare to actuals
+            resid_preds = qmodel.predict(X_val)
+            final_preds = (preds + resid_preds).clip(min=0)   # preds = poisson val preds
+            qmae        = float(mean_absolute_error(y_val, final_preds))
+
+            qfile = f"xgb_{prop}_{tag}.json"
             qmodel.save_model(qfile)
-            print(f"    [{tag}] MAE: {qmae:.3f}  → {qfile}")
+            print(f"    [{tag}] residual MAE: {qmae:.3f}  (raw resid mean={resid_preds.mean():.3f})  → {qfile}")
             results[prop][f"{tag}_mae"]  = qmae
             results[prop][f"{tag}_file"] = qfile
 
@@ -178,6 +194,7 @@ def main():
         "train_seasons":       TRAIN_SEASONS,
         "val_seasons":         VAL_SEASONS,
         "quantiles":           QUANTILES,
+        "quantile_mode":       "residual",   # q25/q50/q75 predict offset from Poisson
     }
     with open("model_meta.json", "w") as f:
         json.dump(meta, f, indent=2)

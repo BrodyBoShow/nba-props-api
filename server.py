@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.13.0"  # ensemble q50+poisson, KNN pace/deff expansion, xgb confidence band
+SERVER_VERSION = "v6.14.0"  # residual quantile, minutes sub-model, game totals, KNN 4D
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -105,6 +105,12 @@ _XGB_MODELS:   dict = {}
 _XGB_QUANTILE: dict = {}   # { "pts": {"q25": model, "q50": model, "q75": model}, ... }
 _XGB_META:     dict = {}
 _XGB_LOAD_ERRORS: dict = {}
+_XGB_MIN_MODEL = None    # dedicated minutes-projection sub-model (xgb_min_model.json)
+_XGB_MIN_META:  dict = {}
+_XGB_MIN_FEATURES = [    # must match train_minutes.py FEATURE_COLS
+    "l5_min", "std_min", "l10_min_std",
+    "gp_prior", "is_home", "rest_days", "opp_pace_roll10", "opp_def_roll10",
+]
 
 _XGB_PROP_MAP = {
     "points":     "pts",
@@ -166,6 +172,22 @@ def _load_xgb_models():
 
     logging.info("XGBoost models loaded: %s (xgb v%s)",
                  loaded or "none", getattr(_xgb_lib, "__version__", "?"))
+
+    # ── Minutes sub-model ─────────────────────────────────────────────────────
+    global _XGB_MIN_MODEL, _XGB_MIN_META
+    min_model_path = os.path.join(base, "xgb_min_model.json")
+    min_meta_path  = os.path.join(base, "model_meta_min.json")
+    if os.path.exists(min_model_path):
+        try:
+            _m = _xgb_lib.XGBRegressor()
+            _m.load_model(min_model_path)
+            _XGB_MIN_MODEL = _m
+            if os.path.exists(min_meta_path):
+                with open(min_meta_path) as f:
+                    _XGB_MIN_META = json.load(f)
+            logging.info("Minutes sub-model loaded (MAE ~%.1f)", _XGB_MIN_META.get("metrics", {}).get("mae", 0))
+        except Exception as e:
+            logging.warning("Minutes model load failed: %s", e)
 
 
 def _dynamic_ttl(base_seconds=3600):
@@ -1418,15 +1440,59 @@ def _xgb_predict(prop_key: str, feature_vals: dict) -> dict | None:
         df_row = pd.DataFrame([row], columns=feature_cols)
         point  = max(0.0, round(float(model.predict(df_row)[0]), 2))
 
-        # Quantile predictions (available after retrain; degrade gracefully if absent)
-        q_models = _XGB_QUANTILE.get(prop_key, {})
-        q25 = max(0.0, round(float(q_models["q25"].predict(df_row)[0]), 2)) if "q25" in q_models else None
-        q50 = max(0.0, round(float(q_models["q50"].predict(df_row)[0]), 2)) if "q50" in q_models else None
-        q75 = max(0.0, round(float(q_models["q75"].predict(df_row)[0]), 2)) if "q75" in q_models else None
+        # Quantile predictions — support both absolute and residual modes.
+        # residual mode (quantile_mode == "residual" in model_meta.json):
+        #   q models predict (actual - poisson); add offset to Poisson point estimate.
+        # absolute mode (legacy): q models predict raw target directly.
+        q_models    = _XGB_QUANTILE.get(prop_key, {})
+        resid_mode  = (_XGB_META or {}).get("quantile_mode") == "residual"
+
+        def _qpred(tag):
+            if tag not in q_models:
+                return None
+            raw = float(q_models[tag].predict(df_row)[0])
+            val = (point + raw) if resid_mode else raw
+            return max(0.0, round(val, 2))
+
+        q25 = _qpred("q25")
+        q50 = _qpred("q50")
+        q75 = _qpred("q75")
 
         return {"point": point, "q25": q25, "q50": q50, "q75": q75}
     except Exception as e:
         logging.warning("XGBoost predict failed (%s): %s", prop_key, e)
+        return None
+
+
+def _predict_minutes(l5_min_v, std_min, l10_min_std, gp_prior,
+                     is_home_v, rest_days_v, opp_pace_roll10, opp_def_roll10) -> float | None:
+    """
+    Use the minutes sub-model to project tonight's minutes.
+    Falls back to None (caller uses historical l5_min) when model isn't loaded.
+    """
+    if _XGB_MIN_MODEL is None:
+        return None
+    try:
+        medians = _XGB_MIN_META.get("medians", {})
+        def _v(val, key):
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                return float(medians.get(key, 0))
+            return float(val)
+        row = [
+            _v(l5_min_v,        "l5_min"),
+            _v(std_min,         "std_min"),
+            _v(l10_min_std,     "l10_min_std"),
+            _v(gp_prior,        "gp_prior"),
+            _v(is_home_v,       "is_home"),
+            _v(rest_days_v,     "rest_days"),
+            _v(opp_pace_roll10, "opp_pace_roll10"),
+            _v(opp_def_roll10,  "opp_def_roll10"),
+        ]
+        df_row = pd.DataFrame([row], columns=_XGB_MIN_FEATURES)
+        pred   = float(_XGB_MIN_MODEL.predict(df_row)[0])
+        return max(0.0, round(pred, 1))
+    except Exception as e:
+        logging.warning("Minutes model predict failed: %s", e)
         return None
 
 
@@ -1504,23 +1570,36 @@ def _build_xgb_features(
         if pts_allowed is not None:
             opp_def_roll10 = float(pts_allowed)
 
+    # ── Minutes sub-model override ────────────────────────────────────────────
+    # Project tonight's minutes rather than using the flat historical L5 average.
+    # Blowout risk (large spread) and pace effects are already encoded in the model.
+    projected_min = _predict_minutes(
+        l5_min_v, std_min, l10_min_std, gp_prior,
+        is_home_v, rest_days_v, opp_pace_roll10, opp_def_roll10,
+    )
+    # Use projected if available, fall back to historical l5_min
+    effective_min = projected_min if projected_min is not None else l5_min_v
+
     return {
-        "l5_pts":        l5_pts,
-        "l5_reb":        l5_reb,
-        "l5_ast":        l5_ast,
-        "l5_min":        l5_min_v,
-        "l5_ts":         l5_ts,
-        "l10_pts_std":   l10_pts_std,
-        "l10_min_std":   l10_min_std,
-        "std_pts":       std_pts,
-        "std_reb":       std_reb,
-        "std_ast":       std_ast,
-        "std_min":       std_min,
-        "gp_prior":      gp_prior,
-        "is_home":       is_home_v,
-        "rest_days":     rest_days_v,
+        "l5_pts":         l5_pts,
+        "l5_reb":         l5_reb,
+        "l5_ast":         l5_ast,
+        "l5_min":         effective_min,   # forward-looking minutes projection
+        "l5_ts":          l5_ts,
+        "l10_pts_std":    l10_pts_std,
+        "l10_min_std":    l10_min_std,
+        "std_pts":        std_pts,
+        "std_reb":        std_reb,
+        "std_ast":        std_ast,
+        "std_min":        std_min,
+        "gp_prior":       gp_prior,
+        "is_home":        is_home_v,
+        "rest_days":      rest_days_v,
         "opp_def_roll10": opp_def_roll10,
         "opp_pace_roll10": opp_pace_roll10,
+        # Diagnostic — visible in xgb_features_debug
+        "_proj_min":      projected_min,
+        "_hist_min":      l5_min_v,
     }
 
 
@@ -1594,6 +1673,123 @@ def _fetch_odds_slate(market: str):
 # Apply TTL cache only when cachetools is available
 if _ODDS_AVAILABLE:
     _fetch_odds_slate = _ct_cached(_ODDS_CACHE)(_fetch_odds_slate)
+
+
+# ── Game totals / spreads cache ───────────────────────────────────────────────
+# Keyed by frozenset of team abbreviations (home, away) → {total, spread, home_team}
+# TTL 600s (same as odds slate). Used to inject game_total + spread_abs into XGBoost.
+_GAME_TOTALS: dict = {}   # {"OKC_DAL": {"total": 238.5, "spread": -7.0, "home": "DAL"}}
+_GAME_TOTALS_TS: float = 0.0
+_GAME_TOTALS_TTL: float = 600.0
+
+_NBA_TEAM_ABBR = {
+    "oklahoma city thunder": "OKC", "dallas mavericks": "DAL", "golden state warriors": "GSW",
+    "los angeles lakers": "LAL", "los angeles clippers": "LAC", "boston celtics": "BOS",
+    "miami heat": "MIA", "milwaukee bucks": "MIL", "denver nuggets": "DEN",
+    "minnesota timberwolves": "MIN", "phoenix suns": "PHX", "sacramento kings": "SAC",
+    "portland trail blazers": "POR", "utah jazz": "UTA", "new orleans pelicans": "NOP",
+    "memphis grizzlies": "MEM", "san antonio spurs": "SAS", "houston rockets": "HOU",
+    "new york knicks": "NYK", "brooklyn nets": "BKN", "philadelphia 76ers": "PHI",
+    "toronto raptors": "TOR", "chicago bulls": "CHI", "cleveland cavaliers": "CLE",
+    "detroit pistons": "DET", "indiana pacers": "IND", "atlanta hawks": "ATL",
+    "charlotte hornets": "CHA", "orlando magic": "ORL", "washington wizards": "WAS",
+}
+
+def _team_abbr(full_name: str) -> str | None:
+    return _NBA_TEAM_ABBR.get(full_name.lower().strip())
+
+
+def _fetch_game_totals() -> dict:
+    """
+    Pull tonight's NBA game totals + spreads from The Odds API (h2h + totals markets).
+    Returns dict keyed "{AWAY}_{HOME}" → {total, spread, home_team}.
+    Cached in _GAME_TOTALS with 600s TTL.
+    """
+    global _GAME_TOTALS, _GAME_TOTALS_TS
+    import time as _time
+    now = _time.time()
+    if now - _GAME_TOTALS_TS < _GAME_TOTALS_TTL and _GAME_TOTALS:
+        return _GAME_TOTALS
+
+    api_key = os.environ.get("ODDS_API_KEY", "")
+    if not api_key or not _ODDS_AVAILABLE:
+        return _GAME_TOTALS
+
+    try:
+        resp = _requests_lib.get(
+            "https://api.the-odds-api.com/v4/sports/basketball_nba/odds",
+            params={
+                "apiKey":     api_key,
+                "regions":    "us",
+                "markets":    "h2h,totals",
+                "oddsFormat": "american",
+            },
+            timeout=10,
+        )
+        if not resp.ok:
+            logging.warning("Game totals fetch %s: %s", resp.status_code, resp.text[:120])
+            return _GAME_TOTALS
+
+        result = {}
+        for game in resp.json():
+            home_team = _team_abbr(game.get("home_team", ""))
+            away_team = _team_abbr(game.get("away_team", ""))
+            if not home_team or not away_team:
+                continue
+            key = f"{away_team}_{home_team}"
+            total = spread = None
+            for book in (game.get("bookmakers") or []):
+                if book.get("key") not in _PRIMARY_BOOKS:
+                    continue
+                for mkt in (book.get("markets") or []):
+                    if mkt["key"] == "totals":
+                        for outcome in (mkt.get("outcomes") or []):
+                            if outcome.get("name") == "Over":
+                                total = float(outcome.get("point", 0))
+                    elif mkt["key"] == "h2h":
+                        # Implied spread from moneyline via log-odds approximation
+                        pass   # simple spread: pull from totals outcome if named "spread"
+            # Also try spreads market explicitly
+            for book in (game.get("bookmakers") or []):
+                if book.get("key") not in _PRIMARY_BOOKS:
+                    continue
+                for mkt in (book.get("markets") or []):
+                    if mkt["key"] == "spreads":
+                        for outcome in (mkt.get("outcomes") or []):
+                            if _team_abbr(outcome.get("name", "")) == home_team:
+                                spread = float(outcome.get("point", 0))
+            if total or spread:
+                result[key] = {
+                    "total":     total,
+                    "spread":    spread,   # home team perspective (neg = favored)
+                    "home_team": home_team,
+                }
+        _GAME_TOTALS    = result
+        _GAME_TOTALS_TS = now
+        logging.info("Game totals loaded: %d games", len(result))
+        return result
+    except Exception as exc:
+        logging.warning("Game totals fetch error: %s", exc)
+        return _GAME_TOTALS
+
+
+def _get_game_context(player_team: str, opp_team: str) -> dict:
+    """Return {total, spread, spread_abs} for a matchup, or {} if unavailable."""
+    totals = _fetch_game_totals()
+    ctx = totals.get(f"{player_team}_{opp_team}") or totals.get(f"{opp_team}_{player_team}")
+    if not ctx:
+        return {}
+    total      = ctx.get("total")
+    spread_raw = ctx.get("spread")
+    home_team  = ctx.get("home_team")
+    # Flip spread to player's perspective (negative = player's team is favored)
+    if spread_raw is not None and home_team and home_team != player_team:
+        spread_raw = -spread_raw
+    return {
+        "total":      total,
+        "spread":     spread_raw,
+        "spread_abs": abs(spread_raw) if spread_raw is not None else None,
+    }
 
 
 @app.route("/api/live-line/<player_name>/<prop_key>", methods=["GET"])
@@ -2517,13 +2713,27 @@ def post_project():
 
     # ── XGBoost confidence band override ─────────────────────────────────────
     # When XGBoost is active and quantile models are loaded, the q25/q75 band
-    # is better calibrated than the simple L5 variance band. Override floor/ceiling
-    # while preserving cv/trust from the heuristic band for UI display.
+    # is better calibrated than the simple L5 variance band.
+    #
+    # In residual mode: q25/q75 from _xgb_predict are already (point + offset).
+    # The offset must be shifted to corr (final adjusted projection) so that
+    # injury cascade additions correctly widen the floor/ceiling.
+    #   floor   = corr + (xgb_q25 - xgb_pred)  ← q25 offset from Poisson
+    #   ceiling = corr + (xgb_q75 - xgb_pred)  ← q75 offset from Poisson
+    # In absolute mode: xgb_q25/q75 used directly (old behavior, pre-retrain).
     if _xgb_used and xgb_q25 is not None and xgb_q75 is not None:
+        resid_mode = (_XGB_META or {}).get("quantile_mode") == "residual"
+        _base_pred = breakdown.get("xgb_base") or xgb_pred or corr
+        if resid_mode and _base_pred:
+            xgb_floor = max(0.0, round(corr + (xgb_q25 - _base_pred), 2))
+            xgb_ceil  = round(corr + (xgb_q75 - _base_pred), 2)
+        else:
+            xgb_floor = xgb_q25
+            xgb_ceil  = xgb_q75
         if confidence_band is None:
             confidence_band = {}
-        confidence_band["floor"]   = xgb_q25
-        confidence_band["ceiling"] = xgb_q75
+        confidence_band["floor"]   = xgb_floor
+        confidence_band["ceiling"] = xgb_ceil
         confidence_band["source"]  = "xgb_quantile"
     elif confidence_band:
         confidence_band["source"]  = "l5_variance"
@@ -2532,6 +2742,18 @@ def post_project():
     book_gap = None
     if book_line and book_line > 0:
         book_gap = round(abs(corr - book_line) / book_line, 4)
+
+    # ── Game context (Vegas total + spread) ──────────────────────────────────
+    # Live from The Odds API, cached 600s. Not yet a training feature (needs
+    # historical odds data), but exposed in response for UI game context strip
+    # and stored in feats for future use when historical data is available.
+    own_team_abbr = player.get("team", "").upper()
+    game_ctx = {}
+    if own_team_abbr and opp_abbr:
+        try:
+            game_ctx = _get_game_context(own_team_abbr, opp_abbr)
+        except Exception:
+            pass
 
     return jsonify({
         "success":               True,
@@ -2548,6 +2770,7 @@ def post_project():
         "monte_carlo":           monte_carlo,
         "drivers":               drivers,
         "breakdown":             breakdown,
+        "game_context":          game_ctx or None,
         "data_quality": {
             "po_gp":          int(po.get("gp") or 0),
             "rs_gp":          int(rs.get("gp") or 0),

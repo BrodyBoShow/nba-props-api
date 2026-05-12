@@ -1,0 +1,36 @@
+{
+  "feature_cols": [
+    "l5_min",
+    "std_min",
+    "l10_min_std",
+    "gp_prior",
+    "is_home",
+    "rest_days",
+    "opp_pace_roll10",
+    "opp_def_roll10"
+  ],
+  "medians": {
+    "l5_min": 24.2,
+    "std_min": 23.49230769230769,
+    "l10_min_std": 5.342700108039421,
+    "gp_prior": 33.0,
+    "is_home": 1.0,
+    "rest_days": 2.0,
+    "opp_pace_roll10": 88.5,
+    "opp_def_roll10": 114.2
+  },
+  "train_seasons": [
+    "2022-23",
+    "2023-24"
+  ],
+  "val_seasons": [
+    "2024-25"
+  ],
+  "metrics": {
+    "rmse": 6.502870898181394,
+    "mae": 5.012886028001924,
+    "within_3": 0.37763428933607984,
+    "within_5": 0.5942798288702266
+  },
+  "best_iteration": 239
+}
