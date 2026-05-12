@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.10.0-live-odds"  # live odds slate fetch + /api/live-line route
+SERVER_VERSION = "v6.11.0-xgb-pure"  # gate Adj 1-12 when XGBoost active (no double-counting)
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1670,453 +1670,461 @@ def post_project():
     # Adj 13 (injury cascade) MUST still run — it encodes real-time injury info
     # that XGBoost's training data cannot know.
     # Adj 14 (residual calibration) MUST still run — personalizes for this matchup.
-    # TODO v2: wrap Adj 1-12 in `if not _xgb_used:` to eliminate double-counting.
+    # v2: Adj 1-12 gated — XGBoost already encodes these features natively.
+    # Only Adj 13 (injury), Adj 15 (blowout), Adj 14 (residual) always fire.
+    if not _xgb_used:
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 1 — AST CONVERSION WEIGHT
-    # Pull astConvRate from tracking. If < 0.25 (cold) → +0.8 AST (player is
-    # not converting chances; mean-reversion says actual assists should rise).
-    # If > 0.35 (hot) → -0.5 AST (over-performing the league model; regress).
-    # Only fires for assist-bearing props (assists, pa, pra).
-    # ─────────────────────────────────────────────────────────────────────────
-    ast_conv_delta = 0.0
-    if prop_type in ("assists", "pa", "pra", "ra") and tracking_row:
-        gp        = int(tracking_row.get("gp") or 0)
-        conv_rate = tracking_row.get("astConvRate")
-        if conv_rate is not None and gp >= 2:
-            if conv_rate < 0.25:
-                ast_conv_delta = +0.8
-                drivers.append(
-                    f"AST Conversion COLD — {resolved_name.title()} converts "
-                    f"{conv_rate:.0%} of potential assists (< 25% cold threshold). "
-                    f"Mean-reversion adds +0.8 AST to projection."
-                )
-            elif conv_rate > 0.35:
-                ast_conv_delta = -0.5
-                drivers.append(
-                    f"AST Conversion HOT — {resolved_name.title()} converts "
-                    f"{conv_rate:.0%} of potential assists (> 35% hot threshold). "
-                    f"Regression to mean removes −0.5 AST from projection."
-                )
-            else:
-                drivers.append(
-                    f"AST Conversion NEUTRAL — {conv_rate:.0%} conversion rate "
-                    f"within normal [25–35%] band; no adjustment."
-                )
-    breakdown["astConvAdj"] = ast_conv_delta
-    corr = round(corr + ast_conv_delta, 2)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 2 — OPPONENT DEFENSE COMPOSITE (EWMA — replaces old Adj 2 + Adj 12)
-    #
-    # COLLINEARITY FIX: The old Adj 2 (matchup delta) and Adj 12 (defensive tier)
-    # were both derived from the same underlying dEFF signal, applied twice against
-    # different baselines (league avg vs 112). This double-counted defensive variance.
-    #
-    # New approach: single EWMA that blends two TRUE data layers:
-    #   • PO dEFF  = opponent's playoff defensive rating (small sample, most recent)
-    #   • RS dEFF  = opponent's full regular-season defensive rating (large sample, stable)
-    #
-    # EWMA alpha scales with opponent's PO game count:
-    #   alpha = min(0.60, po_gp / 14 * 0.60)
-    #   → 0 PO games:  purely RS (season anchor dominates)
-    #   → 7 PO games:  ~30% PO, 70% RS
-    #   → 14 PO games: 60% PO, 40% RS (cap — PO never fully crowds out RS)
-    #
-    # Single shift applied at 1%/pt from 112 baseline, sigmoid-capped at ±8%.
-    # Scoring props: full effect. Rebounds/assists: 40% scale.
-    # ─────────────────────────────────────────────────────────────────────────
-    _DEF_COMPOSITE_PROPS = {
-        **{p: 1.0 for p in _SCORING_PROPS},
-        "rebounds": 0.40,
-        "assists":  0.40,
-    }
-    def_composite_pct = 0.0
-    if prop_type in _DEF_COMPOSITE_PROPS and opp_team_data:
-        po_deff_raw  = opp_team_data.get("poDEFF")
-        rs_deff_raw  = opp_team_data.get("rsDEFF")
-        opp_po_gp    = int(opp_team_data.get("poGP") or 0)
-
-        # Need at least RS dEFF to compute anything meaningful
-        if rs_deff_raw:
-            rs_deff = float(rs_deff_raw)
-            # EWMA alpha: 0→0% PO weight, 14→60% PO weight (capped)
-            alpha = min(0.60, opp_po_gp / 14.0 * 0.60) if opp_po_gp > 0 else 0.0
-            if po_deff_raw and alpha > 0:
-                po_deff = float(po_deff_raw)
-                composite_deff = alpha * po_deff + (1.0 - alpha) * rs_deff
-            else:
-                composite_deff = rs_deff   # pre-playoff or no PO data
-
-            _DEF_COMPOSITE_BASELINE = 112.0   # PO league-average dEFF
-            delta_from_baseline = composite_deff - _DEF_COMPOSITE_BASELINE
-            scale = _DEF_COMPOSITE_PROPS[prop_type]
-            raw_shift = delta_from_baseline * (0.01 / 1.0) * scale  # 1% per dEFF point
-            # Sigmoid-capped: ±8% hard headroom (L = 0.096), smooth approach
-            def_composite_pct = _soft_cap(raw_shift, 0.08)
-
-            if abs(def_composite_pct) >= 0.003:
-                grade = ("ELITE"   if composite_deff <= 108 else
-                         "STRONG"  if composite_deff <= 110 else
-                         "AVERAGE" if composite_deff <= 114 else
-                         "WEAK")
-                def_abs    = round(corr * def_composite_pct, 2)
-                prop_label = "scoring" if prop_type in _SCORING_PROPS else prop_type
-                drivers.append(
-                    f"Defense Composite (EWMA) — {opp_abbr} grades {grade} "
-                    f"({composite_deff:.1f} composite dEFF: "
-                    f"{alpha*100:.0f}% PO [{po_deff_raw or 'n/a'}] + "
-                    f"{(1-alpha)*100:.0f}% RS [{rs_deff:.1f}], {prop_label} effect). "
-                    f"Impact: {def_composite_pct*100:+.1f}% ({def_abs:+.2f})."
-                )
-    breakdown["defCompositeAdj"] = round(def_composite_pct * 100, 2)
-    corr = round(corr * (1.0 + def_composite_pct), 2)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 3 — SHOT PROFILE ALIGNMENT
-    # Points props only. If player scores ≥35% of their pts from 3s AND
-    # the opponent's 3pt defense is elite (fg3VsAvg ≤ -1.5%), apply -1.0 pt.
-    # Inverse: if opponent leaks 3s (fg3VsAvg ≥ +1.5%), apply +0.5 pt bonus.
-    # ─────────────────────────────────────────────────────────────────────────
-    shot_delta = 0.0
-    if prop_type in ("points", "pra", "pr") and scoring_row and opp_def:
-        pct_3pt     = float(scoring_row.get("pctPts3pt") or 0)
-        fg3_vs_avg  = float(opp_def.get("fg3VsAvg") or 0)
-        is_3pt_guy  = pct_3pt >= _THREE_PT_RELY_THRESH
-        elite_def   = fg3_vs_avg <= _FG3_ELITE_DEF_THRESH
-        weak_def    = fg3_vs_avg >= 0.015
-        if is_3pt_guy and elite_def:
-            shot_delta = -1.0
-            drivers.append(
-                f"Shot Profile MISMATCH — {resolved_name.title()} derives "
-                f"{pct_3pt:.0f}% of pts from 3s, but {opp_abbr} is an elite "
-                f"3pt defense ({fg3_vs_avg:+.1%} vs league avg). Penalty: −1.0 pt."
-            )
-        elif is_3pt_guy and weak_def:
-            shot_delta = +0.5
-            drivers.append(
-                f"Shot Profile BOOST — {resolved_name.title()} derives "
-                f"{pct_3pt:.0f}% of pts from 3s and {opp_abbr} leaks threes "
-                f"({fg3_vs_avg:+.1%} vs league avg). Bonus: +0.5 pts."
-            )
-    breakdown["shotProfileAdj"] = shot_delta
-    corr = round(corr + shot_delta, 2)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 4 — HUSTLE / REBOUND REALIZATION RATE
-    # For rebound props: calculate the player's realization rate
-    # (rebChancePct vs 55% league avg). Each 10% above/below avg ≈ ±5%
-    # shift in projection. Cap ±8%.
-    # ─────────────────────────────────────────────────────────────────────────
-    hustle_delta = 0.0
-    if prop_type in ("rebounds", "pr", "pra", "ra") and tracking_row:
-        gp              = int(tracking_row.get("gp") or 0)
-        reb_chance_pct  = float(tracking_row.get("rebChancePct") or 0)
-        total_chances   = float((tracking_row.get("orebChance") or 0) +
-                                (tracking_row.get("drebChance") or 0))
-        if gp >= 2 and total_chances >= 1.0 and reb_chance_pct > 0:
-            rate_vs_league = (reb_chance_pct - _LEAGUE_AVG_REB_CONV) / _LEAGUE_AVG_REB_CONV
-            hustle_pct     = _soft_cap(rate_vs_league * 0.5, 0.08)   # sigmoid, was hard ±8%
-            hustle_delta   = round(corr * hustle_pct, 2)
-            if abs(hustle_pct) >= 0.005:
-                direction = "ABOVE" if rate_vs_league > 0 else "BELOW"
-                drivers.append(
-                    f"Rebound Realization Rate — {resolved_name.title()} secures "
-                    f"{reb_chance_pct:.1f}% of rebound chances vs "
-                    f"{_LEAGUE_AVG_REB_CONV}% league avg "
-                    f"({abs(rate_vs_league)*100:.1f}% {direction} avg, "
-                    f"{total_chances:.1f} chances/gm). "
-                    f"Impact: {hustle_delta:+.2f} reb."
-                )
-    breakdown["hustleAdj"] = hustle_delta
-    corr = round(corr + hustle_delta, 1)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 5 — PACE CONTEXT
-    # When use_rate_base=True, pace is already baked into projected_minutes inside
-    # _base_stat (Rate×Minutes baseline). Firing Adj 5 on top would double-count it.
-    # When use_rate_base=False (per-game fallback), fire normally with sigmoid cap.
-    # ─────────────────────────────────────────────────────────────────────────
-    pace_pct = 0.0
-    if prop_type in _COUNTING_PROPS and not use_rate_base:
-        own_pace = float(own_team_data.get("rsPace") or 0)
-        opp_pace = float(opp_team_data.get("rsPace") or 0)
-        if own_pace > 50 and opp_pace > 50:
-            game_pace = round((own_pace + opp_pace) / 2, 1)
-            delta_pct = (game_pace - _LEAGUE_AVG_PACE) / _LEAGUE_AVG_PACE
-            pace_pct  = _soft_cap(delta_pct, _PACE_CAP)   # sigmoid, was hard ±5%
-            if abs(pace_pct) >= 0.005:
-                tempo = "FAST" if delta_pct > 0 else "SLOW"
-                pace_abs = round(corr * pace_pct, 2)
-                drivers.append(
-                    f"Pace Context — {tempo} game expected ({game_pace} possessions/48 vs "
-                    f"{_LEAGUE_AVG_PACE} league avg). Each possession = scoring opportunity. "
-                    f"Impact: {pace_pct*100:+.1f}% ({pace_abs:+.2f})."
-                )
-    elif use_rate_base and prop_type in _COUNTING_PROPS:
-        # Pace already baked into projected minutes in the baseline
-        own_pace = float(own_team_data.get("rsPace") or 0)
-        opp_pace = float(opp_team_data.get("rsPace") or 0)
-        if own_pace > 50 and opp_pace > 50:
-            game_pace = round((own_pace + opp_pace) / 2, 1)
-            drivers.append(
-                f"Pace Context — {game_pace} possessions/48 already factored into "
-                f"projected minutes (Rate×Minutes baseline active). No separate Adj 5."
-            )
-    breakdown["paceAdj"] = round(pace_pct * 100, 2)
-    corr = round(corr * (1 + pace_pct), 2)
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 6 — RECENT FORM (informational driver, not double-counted)
-    # L5 is now baked into the BASELINE itself (35% weight in _base_stat),
-    # so we don't apply a SECOND adjustment on top. Instead, expose the L5
-    # divergence vs RS+PO blend as an informational driver if meaningful.
-    # ─────────────────────────────────────────────────────────────────────────
-    form_delta = 0.0
-    if l5_avg is not None:
-        try:
-            l5 = float(l5_avg)
-            # Compare L5 vs PO+RS-only blend (without L5) for an info-only "form" signal
-            def _s2(d, k): return float(d.get(k) or 0)
-            key_map_2 = {"points":"ppg","assists":"apg","rebounds":"rpg",
-                         "steals":"spg","blocks":"bpg",
-                         "pra":("ppg","rpg","apg"),"pa":("ppg","apg"),"pr":("ppg","rpg"),
-                         "ra":("rpg","apg")}
-            k2 = key_map_2.get(prop_type)
-            if k2 and l5 > 0:
-                if isinstance(k2, tuple):
-                    po_v2 = sum(_s2(po, x) for x in k2)
-                    rs_v2 = sum(_s2(rs, x) for x in k2)
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 1 — AST CONVERSION WEIGHT
+        # Pull astConvRate from tracking. If < 0.25 (cold) → +0.8 AST (player is
+        # not converting chances; mean-reversion says actual assists should rise).
+        # If > 0.35 (hot) → -0.5 AST (over-performing the league model; regress).
+        # Only fires for assist-bearing props (assists, pa, pra).
+        # ─────────────────────────────────────────────────────────────────────────
+        ast_conv_delta = 0.0
+        if prop_type in ("assists", "pa", "pra", "ra") and tracking_row:
+            gp        = int(tracking_row.get("gp") or 0)
+            conv_rate = tracking_row.get("astConvRate")
+            if conv_rate is not None and gp >= 2:
+                if conv_rate < 0.25:
+                    ast_conv_delta = +0.8
+                    drivers.append(
+                        f"AST Conversion COLD — {resolved_name.title()} converts "
+                        f"{conv_rate:.0%} of potential assists (< 25% cold threshold). "
+                        f"Mean-reversion adds +0.8 AST to projection."
+                    )
+                elif conv_rate > 0.35:
+                    ast_conv_delta = -0.5
+                    drivers.append(
+                        f"AST Conversion HOT — {resolved_name.title()} converts "
+                        f"{conv_rate:.0%} of potential assists (> 35% hot threshold). "
+                        f"Regression to mean removes −0.5 AST from projection."
+                    )
                 else:
-                    po_v2 = _s2(po, k2)
-                    rs_v2 = _s2(rs, k2)
-                season_blend = round(po_v2 * 0.65 + rs_v2 * 0.35, 2)
-                if season_blend > 0:
-                    divergence = (l5 - season_blend) / season_blend
-                    if abs(divergence) >= 0.10:  # only call out meaningful divergence
-                        trend = "HOT" if divergence > 0 else "COLD"
-                        drivers.append(
-                            f"Recent Form — {resolved_name.title()} {trend} over L5 "
-                            f"({l5:.1f} vs {season_blend:.1f} season blend, "
-                            f"{divergence*100:+.1f}%). Already blended into base "
-                            f"projection (L5 = 35% weight)."
-                        )
-        except (TypeError, ValueError):
-            pass
-    breakdown["recentFormAdj"] = form_delta  # always 0 now (baked into base)
+                    drivers.append(
+                        f"AST Conversion NEUTRAL — {conv_rate:.0%} conversion rate "
+                        f"within normal [25–35%] band; no adjustment."
+                    )
+        breakdown["astConvAdj"] = ast_conv_delta
+        corr = round(corr + ast_conv_delta, 2)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 7 — REST DAYS (client-passed)
-    # 0 days rest (back-to-back) = -3% counting stats (documented effect).
-    # 2+ days rest = +1.5% (full recovery).
-    # 1 day rest = baseline (no adjustment).
-    # ─────────────────────────────────────────────────────────────────────────
-    rest_pct = 0.0
-    if rest_days is not None and prop_type in _COUNTING_PROPS:
-        try:
-            rd = int(rest_days)
-            if rd == 0:
-                rest_pct = _REST_B2B
-                label = "BACK-TO-BACK FATIGUE"
-            elif rd >= 2:
-                rest_pct = _REST_LONG
-                label = "WELL-RESTED"
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 2 — OPPONENT DEFENSE COMPOSITE (EWMA — replaces old Adj 2 + Adj 12)
+        #
+        # COLLINEARITY FIX: The old Adj 2 (matchup delta) and Adj 12 (defensive tier)
+        # were both derived from the same underlying dEFF signal, applied twice against
+        # different baselines (league avg vs 112). This double-counted defensive variance.
+        #
+        # New approach: single EWMA that blends two TRUE data layers:
+        #   • PO dEFF  = opponent's playoff defensive rating (small sample, most recent)
+        #   • RS dEFF  = opponent's full regular-season defensive rating (large sample, stable)
+        #
+        # EWMA alpha scales with opponent's PO game count:
+        #   alpha = min(0.60, po_gp / 14 * 0.60)
+        #   → 0 PO games:  purely RS (season anchor dominates)
+        #   → 7 PO games:  ~30% PO, 70% RS
+        #   → 14 PO games: 60% PO, 40% RS (cap — PO never fully crowds out RS)
+        #
+        # Single shift applied at 1%/pt from 112 baseline, sigmoid-capped at ±8%.
+        # Scoring props: full effect. Rebounds/assists: 40% scale.
+        # ─────────────────────────────────────────────────────────────────────────
+        _DEF_COMPOSITE_PROPS = {
+            **{p: 1.0 for p in _SCORING_PROPS},
+            "rebounds": 0.40,
+            "assists":  0.40,
+        }
+        def_composite_pct = 0.0
+        if prop_type in _DEF_COMPOSITE_PROPS and opp_team_data:
+            po_deff_raw  = opp_team_data.get("poDEFF")
+            rs_deff_raw  = opp_team_data.get("rsDEFF")
+            opp_po_gp    = int(opp_team_data.get("poGP") or 0)
+
+            # Need at least RS dEFF to compute anything meaningful
+            if rs_deff_raw:
+                rs_deff = float(rs_deff_raw)
+                # EWMA alpha: 0→0% PO weight, 14→60% PO weight (capped)
+                alpha = min(0.60, opp_po_gp / 14.0 * 0.60) if opp_po_gp > 0 else 0.0
+                if po_deff_raw and alpha > 0:
+                    po_deff = float(po_deff_raw)
+                    composite_deff = alpha * po_deff + (1.0 - alpha) * rs_deff
+                else:
+                    composite_deff = rs_deff   # pre-playoff or no PO data
+
+                _DEF_COMPOSITE_BASELINE = 112.0   # PO league-average dEFF
+                delta_from_baseline = composite_deff - _DEF_COMPOSITE_BASELINE
+                scale = _DEF_COMPOSITE_PROPS[prop_type]
+                raw_shift = delta_from_baseline * (0.01 / 1.0) * scale  # 1% per dEFF point
+                # Sigmoid-capped: ±8% hard headroom (L = 0.096), smooth approach
+                def_composite_pct = _soft_cap(raw_shift, 0.08)
+
+                if abs(def_composite_pct) >= 0.003:
+                    grade = ("ELITE"   if composite_deff <= 108 else
+                             "STRONG"  if composite_deff <= 110 else
+                             "AVERAGE" if composite_deff <= 114 else
+                             "WEAK")
+                    def_abs    = round(corr * def_composite_pct, 2)
+                    prop_label = "scoring" if prop_type in _SCORING_PROPS else prop_type
+                    drivers.append(
+                        f"Defense Composite (EWMA) — {opp_abbr} grades {grade} "
+                        f"({composite_deff:.1f} composite dEFF: "
+                        f"{alpha*100:.0f}% PO [{po_deff_raw or 'n/a'}] + "
+                        f"{(1-alpha)*100:.0f}% RS [{rs_deff:.1f}], {prop_label} effect). "
+                        f"Impact: {def_composite_pct*100:+.1f}% ({def_abs:+.2f})."
+                    )
+        breakdown["defCompositeAdj"] = round(def_composite_pct * 100, 2)
+        corr = round(corr * (1.0 + def_composite_pct), 2)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 3 — SHOT PROFILE ALIGNMENT
+        # Points props only. If player scores ≥35% of their pts from 3s AND
+        # the opponent's 3pt defense is elite (fg3VsAvg ≤ -1.5%), apply -1.0 pt.
+        # Inverse: if opponent leaks 3s (fg3VsAvg ≥ +1.5%), apply +0.5 pt bonus.
+        # ─────────────────────────────────────────────────────────────────────────
+        shot_delta = 0.0
+        if prop_type in ("points", "pra", "pr") and scoring_row and opp_def:
+            pct_3pt     = float(scoring_row.get("pctPts3pt") or 0)
+            fg3_vs_avg  = float(opp_def.get("fg3VsAvg") or 0)
+            is_3pt_guy  = pct_3pt >= _THREE_PT_RELY_THRESH
+            elite_def   = fg3_vs_avg <= _FG3_ELITE_DEF_THRESH
+            weak_def    = fg3_vs_avg >= 0.015
+            if is_3pt_guy and elite_def:
+                shot_delta = -1.0
+                drivers.append(
+                    f"Shot Profile MISMATCH — {resolved_name.title()} derives "
+                    f"{pct_3pt:.0f}% of pts from 3s, but {opp_abbr} is an elite "
+                    f"3pt defense ({fg3_vs_avg:+.1%} vs league avg). Penalty: −1.0 pt."
+                )
+            elif is_3pt_guy and weak_def:
+                shot_delta = +0.5
+                drivers.append(
+                    f"Shot Profile BOOST — {resolved_name.title()} derives "
+                    f"{pct_3pt:.0f}% of pts from 3s and {opp_abbr} leaks threes "
+                    f"({fg3_vs_avg:+.1%} vs league avg). Bonus: +0.5 pts."
+                )
+        breakdown["shotProfileAdj"] = shot_delta
+        corr = round(corr + shot_delta, 2)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 4 — HUSTLE / REBOUND REALIZATION RATE
+        # For rebound props: calculate the player's realization rate
+        # (rebChancePct vs 55% league avg). Each 10% above/below avg ≈ ±5%
+        # shift in projection. Cap ±8%.
+        # ─────────────────────────────────────────────────────────────────────────
+        hustle_delta = 0.0
+        if prop_type in ("rebounds", "pr", "pra", "ra") and tracking_row:
+            gp              = int(tracking_row.get("gp") or 0)
+            reb_chance_pct  = float(tracking_row.get("rebChancePct") or 0)
+            total_chances   = float((tracking_row.get("orebChance") or 0) +
+                                    (tracking_row.get("drebChance") or 0))
+            if gp >= 2 and total_chances >= 1.0 and reb_chance_pct > 0:
+                rate_vs_league = (reb_chance_pct - _LEAGUE_AVG_REB_CONV) / _LEAGUE_AVG_REB_CONV
+                hustle_pct     = _soft_cap(rate_vs_league * 0.5, 0.08)   # sigmoid, was hard ±8%
+                hustle_delta   = round(corr * hustle_pct, 2)
+                if abs(hustle_pct) >= 0.005:
+                    direction = "ABOVE" if rate_vs_league > 0 else "BELOW"
+                    drivers.append(
+                        f"Rebound Realization Rate — {resolved_name.title()} secures "
+                        f"{reb_chance_pct:.1f}% of rebound chances vs "
+                        f"{_LEAGUE_AVG_REB_CONV}% league avg "
+                        f"({abs(rate_vs_league)*100:.1f}% {direction} avg, "
+                        f"{total_chances:.1f} chances/gm). "
+                        f"Impact: {hustle_delta:+.2f} reb."
+                    )
+        breakdown["hustleAdj"] = hustle_delta
+        corr = round(corr + hustle_delta, 1)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 5 — PACE CONTEXT
+        # When use_rate_base=True, pace is already baked into projected_minutes inside
+        # _base_stat (Rate×Minutes baseline). Firing Adj 5 on top would double-count it.
+        # When use_rate_base=False (per-game fallback), fire normally with sigmoid cap.
+        # ─────────────────────────────────────────────────────────────────────────
+        pace_pct = 0.0
+        if prop_type in _COUNTING_PROPS and not use_rate_base:
+            own_pace = float(own_team_data.get("rsPace") or 0)
+            opp_pace = float(opp_team_data.get("rsPace") or 0)
+            if own_pace > 50 and opp_pace > 50:
+                game_pace = round((own_pace + opp_pace) / 2, 1)
+                delta_pct = (game_pace - _LEAGUE_AVG_PACE) / _LEAGUE_AVG_PACE
+                pace_pct  = _soft_cap(delta_pct, _PACE_CAP)   # sigmoid, was hard ±5%
+                if abs(pace_pct) >= 0.005:
+                    tempo = "FAST" if delta_pct > 0 else "SLOW"
+                    pace_abs = round(corr * pace_pct, 2)
+                    drivers.append(
+                        f"Pace Context — {tempo} game expected ({game_pace} possessions/48 vs "
+                        f"{_LEAGUE_AVG_PACE} league avg). Each possession = scoring opportunity. "
+                        f"Impact: {pace_pct*100:+.1f}% ({pace_abs:+.2f})."
+                    )
+        elif use_rate_base and prop_type in _COUNTING_PROPS:
+            # Pace already baked into projected minutes in the baseline
+            own_pace = float(own_team_data.get("rsPace") or 0)
+            opp_pace = float(opp_team_data.get("rsPace") or 0)
+            if own_pace > 50 and opp_pace > 50:
+                game_pace = round((own_pace + opp_pace) / 2, 1)
+                drivers.append(
+                    f"Pace Context — {game_pace} possessions/48 already factored into "
+                    f"projected minutes (Rate×Minutes baseline active). No separate Adj 5."
+                )
+        breakdown["paceAdj"] = round(pace_pct * 100, 2)
+        corr = round(corr * (1 + pace_pct), 2)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 6 — RECENT FORM (informational driver, not double-counted)
+        # L5 is now baked into the BASELINE itself (35% weight in _base_stat),
+        # so we don't apply a SECOND adjustment on top. Instead, expose the L5
+        # divergence vs RS+PO blend as an informational driver if meaningful.
+        # ─────────────────────────────────────────────────────────────────────────
+        form_delta = 0.0
+        if l5_avg is not None:
+            try:
+                l5 = float(l5_avg)
+                # Compare L5 vs PO+RS-only blend (without L5) for an info-only "form" signal
+                def _s2(d, k): return float(d.get(k) or 0)
+                key_map_2 = {"points":"ppg","assists":"apg","rebounds":"rpg",
+                             "steals":"spg","blocks":"bpg",
+                             "pra":("ppg","rpg","apg"),"pa":("ppg","apg"),"pr":("ppg","rpg"),
+                             "ra":("rpg","apg")}
+                k2 = key_map_2.get(prop_type)
+                if k2 and l5 > 0:
+                    if isinstance(k2, tuple):
+                        po_v2 = sum(_s2(po, x) for x in k2)
+                        rs_v2 = sum(_s2(rs, x) for x in k2)
+                    else:
+                        po_v2 = _s2(po, k2)
+                        rs_v2 = _s2(rs, k2)
+                    season_blend = round(po_v2 * 0.65 + rs_v2 * 0.35, 2)
+                    if season_blend > 0:
+                        divergence = (l5 - season_blend) / season_blend
+                        if abs(divergence) >= 0.10:  # only call out meaningful divergence
+                            trend = "HOT" if divergence > 0 else "COLD"
+                            drivers.append(
+                                f"Recent Form — {resolved_name.title()} {trend} over L5 "
+                                f"({l5:.1f} vs {season_blend:.1f} season blend, "
+                                f"{divergence*100:+.1f}%). Already blended into base "
+                                f"projection (L5 = 35% weight)."
+                            )
+            except (TypeError, ValueError):
+                pass
+        breakdown["recentFormAdj"] = form_delta  # always 0 now (baked into base)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 7 — REST DAYS (client-passed)
+        # 0 days rest (back-to-back) = -3% counting stats (documented effect).
+        # 2+ days rest = +1.5% (full recovery).
+        # 1 day rest = baseline (no adjustment).
+        # ─────────────────────────────────────────────────────────────────────────
+        rest_pct = 0.0
+        if rest_days is not None and prop_type in _COUNTING_PROPS:
+            try:
+                rd = int(rest_days)
+                if rd == 0:
+                    rest_pct = _REST_B2B
+                    label = "BACK-TO-BACK FATIGUE"
+                elif rd >= 2:
+                    rest_pct = _REST_LONG
+                    label = "WELL-RESTED"
+                else:
+                    label = None
+                if label:
+                    rest_abs = round(corr * rest_pct, 2)
+                    drivers.append(
+                        f"Rest Differential — {label} ({rd} days off). "
+                        f"Documented physiological effect: {rest_pct*100:+.1f}% ({rest_abs:+.2f})."
+                    )
+            except (TypeError, ValueError):
+                pass
+        breakdown["restAdj"] = round(rest_pct * 100, 2)
+        corr = round(corr * (1 + rest_pct), 2)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 8 — HOME / ROAD SPLIT (data-verified)
+        # Pulls player's PO home vs road averages from splits cache. If the player
+        # has a meaningful split for this prop, apply 40% of the differential.
+        # Cap ±6%. Requires client to pass is_home and prop must be home/road relevant.
+        # ─────────────────────────────────────────────────────────────────────────
+        splits_pct = 0.0
+        if splits_row and is_home is not None and prop_type in ("points","assists","rebounds","pra","pa","pr","ra"):
+            home = splits_row.get("home") or {}
+            road = splits_row.get("road") or {}
+            key_map = {
+                "points":"ppg", "assists":"apg", "rebounds":"rpg",
+                "pra":["ppg","rpg","apg"], "pa":["ppg","apg"], "pr":["ppg","rpg"], "ra":["rpg","apg"],
+            }
+            k = key_map.get(prop_type)
+            h_gp = int(home.get("gp") or 0)
+            r_gp = int(road.get("gp") or 0)
+            if h_gp >= 1 and r_gp >= 1 and k:
+                if isinstance(k, list):
+                    h = sum(float(home.get(x) or 0) for x in k)
+                    r = sum(float(road.get(x) or 0) for x in k)
+                else:
+                    h = float(home.get(k) or 0)
+                    r = float(road.get(k) or 0)
+                if h > 0 and r > 0:
+                    venue_avg = h if is_home else r
+                    other_avg = r if is_home else h
+                    avg = (h + r) / 2
+                    delta_pct = (venue_avg - other_avg) / avg if avg > 0 else 0
+                    splits_pct = _soft_cap(delta_pct * _SPLIT_BLEND_WEIGHT, _SPLIT_CAP)  # sigmoid, was hard ±6%
+                    if abs(splits_pct) >= 0.005:
+                        venue = "HOME" if is_home else "ROAD"
+                        splits_abs = round(corr * splits_pct, 2)
+                        drivers.append(
+                            f"Venue Split — {resolved_name.title()} averages {venue_avg:.1f} at {venue} "
+                            f"vs {other_avg:.1f} at other venue ({h_gp}H/{r_gp}R PO games). "
+                            f"Impact: {splits_pct*100:+.1f}% ({splits_abs:+.2f})."
+                        )
+        breakdown["splitsAdj"] = round(splits_pct * 100, 2)
+        corr = round(corr * (1 + splits_pct), 2)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 9 — CLUTCH PERFORMANCE (data-verified, high-leverage only)
+        # Compares player's clutch per-minute production to regular per-minute rate.
+        # Only fires when:
+        #   • client flagged high_leverage=true (Game 7, elimination, etc.)
+        #   • clutch sample is meaningful (≥1 min/game in clutch situations)
+        #   • divergence is significant (≥20% above/below regular rate)
+        # ─────────────────────────────────────────────────────────────────────────
+        clutch_delta = 0.0
+        # Map prop_type → (clutch_key, regular_key, stat_label, abs_cap)
+        _CLUTCH_STAT_MAP = {
+            "points":         ("ppg", "ppg", "pts", 0.6),
+            "pra":            ("ppg", "ppg", "pts", 0.6),
+            "pa":             ("ppg", "ppg", "pts", 0.6),
+            "pr":             ("ppg", "ppg", "pts", 0.6),
+            "three_pointers": ("ppg", "ppg", "pts", 0.6),
+            "rebounds":       ("rpg", "rpg", "reb", 0.4),
+            "assists":        ("apg", "apg", "ast", 0.3),
+            "ra":             ("rpg", "rpg", "reb+ast", 0.4),
+        }
+        if high_leverage and clutch_row and prop_type in _CLUTCH_STAT_MAP:
+            c_key, r_key, stat_lbl, abs_cap = _CLUTCH_STAT_MAP[prop_type]
+            c_stat = float(clutch_row.get(c_key) or 0)
+            c_min  = float(clutch_row.get("min") or 0)
+            c_gp   = int(clutch_row.get("gp") or 0)
+            r_stat = float(po.get(r_key) or rs.get(r_key) or 0)
+            r_min  = float(po.get("min") or rs.get("min") or 0)
+            if c_min >= 1.0 and c_gp >= 2 and r_stat > 0 and r_min > 5:
+                c_per_min = c_stat / max(c_min, 0.5)
+                r_per_min = r_stat / max(r_min, 0.5)
+                lift = (c_per_min - r_per_min) / r_per_min if r_per_min > 0 else 0
+                if abs(lift) >= _CLUTCH_LIFT_THRESH:
+                    # Apply 50% of the lift, capped by stat type
+                    clutch_delta = round(_soft_cap(lift * 0.5, abs_cap), 2)  # sigmoid, was hard ±abs_cap
+                    label = "ELEVATES" if lift > 0 else "SHRINKS"
+                    drivers.append(
+                        f"Clutch Profile (HIGH-LEVERAGE) — {resolved_name.title()} {label} "
+                        f"in clutch ({c_per_min*36:.1f} {stat_lbl}/36 vs {r_per_min*36:.1f} regular, "
+                        f"{c_gp} clutch games). Game-7 boost: {clutch_delta:+.2f}."
+                    )
+        breakdown["clutchAdj"] = clutch_delta
+        corr = round(corr + clutch_delta, 2)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 10 — USAGE × EFFICIENCY PROFILE (data-verified)
+        # USG% measures % of team plays that end with this player (shot/TO/FT).
+        # Combined with TS% (true shooting), this tells us:
+        #   • Elite USG (>28%) + good TS (>55%) → +2% (efficient volume scorer)
+        #   • Elite USG (>28%) + low TS (<50%)  → -1.5% (volume inefficiency)
+        # No adjustment for league-average USG to avoid noise.
+        # ─────────────────────────────────────────────────────────────────────────
+        usg_pct_adj = 0.0
+        po_usg = float(po.get("usg") or 0)
+        po_ts  = float(po.get("ts")  or 0)
+        if prop_type in _SCORING_PROPS and po_usg > 0:
+            if po_usg >= _USG_ELITE_THRESH and po_ts >= _TS_GOOD_THRESH:
+                usg_pct_adj = 0.02
+                label = "ELITE-VOLUME EFFICIENT"
+            elif po_usg >= _USG_ELITE_THRESH and po_ts < _TS_BAD_THRESH:
+                usg_pct_adj = -0.015
+                label = "HIGH-VOLUME INEFFICIENT"
             else:
                 label = None
             if label:
-                rest_abs = round(corr * rest_pct, 2)
+                usg_abs = round(corr * usg_pct_adj, 2)
                 drivers.append(
-                    f"Rest Differential — {label} ({rd} days off). "
-                    f"Documented physiological effect: {rest_pct*100:+.1f}% ({rest_abs:+.2f})."
+                    f"Usage Profile — {label} ({po_usg:.0f}% USG, {po_ts:.0f}% TS). "
+                    f"Impact: {usg_pct_adj*100:+.1f}% ({usg_abs:+.2f})."
                 )
-        except (TypeError, ValueError):
-            pass
-    breakdown["restAdj"] = round(rest_pct * 100, 2)
-    corr = round(corr * (1 + rest_pct), 2)
+        breakdown["usageAdj"] = round(usg_pct_adj * 100, 2)
+        corr = round(corr * (1 + usg_pct_adj), 2)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 8 — HOME / ROAD SPLIT (data-verified)
-    # Pulls player's PO home vs road averages from splits cache. If the player
-    # has a meaningful split for this prop, apply 40% of the differential.
-    # Cap ±6%. Requires client to pass is_home and prop must be home/road relevant.
-    # ─────────────────────────────────────────────────────────────────────────
-    splits_pct = 0.0
-    if splits_row and is_home is not None and prop_type in ("points","assists","rebounds","pra","pa","pr","ra"):
-        home = splits_row.get("home") or {}
-        road = splits_row.get("road") or {}
-        key_map = {
-            "points":"ppg", "assists":"apg", "rebounds":"rpg",
-            "pra":["ppg","rpg","apg"], "pa":["ppg","apg"], "pr":["ppg","rpg"], "ra":["rpg","apg"],
-        }
-        k = key_map.get(prop_type)
-        h_gp = int(home.get("gp") or 0)
-        r_gp = int(road.get("gp") or 0)
-        if h_gp >= 1 and r_gp >= 1 and k:
-            if isinstance(k, list):
-                h = sum(float(home.get(x) or 0) for x in k)
-                r = sum(float(road.get(x) or 0) for x in k)
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 11 — POST-SEASON ELEVATION (data-verified, no client context)
+        # Some players elevate in playoffs (Jimmy Butler, Jokic, Tatum); others
+        # fade. Compares per-game PO production vs RS for the SAME prop type.
+        # Apply 30% of divergence as adjustment. Cap ±6%. Requires PO sample ≥3.
+        # This signal fires for almost every player — captures playoff-specific form.
+        # ─────────────────────────────────────────────────────────────────────────
+        elev_pct = 0.0
+        po_gp_check = int(po.get("gp") or 0)
+        rs_gp_check = int(rs.get("gp") or 0)
+        if po_gp_check >= 3 and rs_gp_check >= 5 and prop_type in ("points","assists","rebounds","pra","pa","pr","ra","steals","blocks"):
+            key_map = {
+                "points":"ppg", "assists":"apg", "rebounds":"rpg",
+                "steals":"spg", "blocks":"bpg",
+                "pra":("ppg","rpg","apg"), "pa":("ppg","apg"), "pr":("ppg","rpg"), "ra":("rpg","apg"),
+            }
+            k = key_map.get(prop_type)
+            if isinstance(k, tuple):
+                po_v = sum(float(po.get(x) or 0) for x in k)
+                rs_v = sum(float(rs.get(x) or 0) for x in k)
             else:
-                h = float(home.get(k) or 0)
-                r = float(road.get(k) or 0)
-            if h > 0 and r > 0:
-                venue_avg = h if is_home else r
-                other_avg = r if is_home else h
-                avg = (h + r) / 2
-                delta_pct = (venue_avg - other_avg) / avg if avg > 0 else 0
-                splits_pct = _soft_cap(delta_pct * _SPLIT_BLEND_WEIGHT, _SPLIT_CAP)  # sigmoid, was hard ±6%
-                if abs(splits_pct) >= 0.005:
-                    venue = "HOME" if is_home else "ROAD"
-                    splits_abs = round(corr * splits_pct, 2)
+                po_v = float(po.get(k) or 0)
+                rs_v = float(rs.get(k) or 0)
+            if po_v > 0 and rs_v > 0:
+                po_lift = (po_v - rs_v) / rs_v
+                if abs(po_lift) >= 0.10:  # ≥10% divergence is meaningful
+                    elev_pct = _soft_cap(po_lift * 0.30, 0.06)  # sigmoid, was hard ±6%
+                    elev_abs = round(corr * elev_pct, 2)
+                    label = "ELEVATING" if po_lift > 0 else "FADING"
                     drivers.append(
-                        f"Venue Split — {resolved_name.title()} averages {venue_avg:.1f} at {venue} "
-                        f"vs {other_avg:.1f} at other venue ({h_gp}H/{r_gp}R PO games). "
-                        f"Impact: {splits_pct*100:+.1f}% ({splits_abs:+.2f})."
+                        f"Playoff Form — {resolved_name.title()} {label} in PO "
+                        f"({po_v:.1f} per game over {po_gp_check} PO games vs "
+                        f"{rs_v:.1f} over {rs_gp_check} RS games, {po_lift*100:+.1f}%). "
+                        f"Impact: {elev_pct*100:+.1f}% ({elev_abs:+.2f})."
                     )
-    breakdown["splitsAdj"] = round(splits_pct * 100, 2)
-    corr = round(corr * (1 + splits_pct), 2)
+        breakdown["playoffFormAdj"] = round(elev_pct * 100, 2)
+        corr = round(corr * (1 + elev_pct), 2)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 9 — CLUTCH PERFORMANCE (data-verified, high-leverage only)
-    # Compares player's clutch per-minute production to regular per-minute rate.
-    # Only fires when:
-    #   • client flagged high_leverage=true (Game 7, elimination, etc.)
-    #   • clutch sample is meaningful (≥1 min/game in clutch situations)
-    #   • divergence is significant (≥20% above/below regular rate)
-    # ─────────────────────────────────────────────────────────────────────────
-    clutch_delta = 0.0
-    # Map prop_type → (clutch_key, regular_key, stat_label, abs_cap)
-    _CLUTCH_STAT_MAP = {
-        "points":         ("ppg", "ppg", "pts", 0.6),
-        "pra":            ("ppg", "ppg", "pts", 0.6),
-        "pa":             ("ppg", "ppg", "pts", 0.6),
-        "pr":             ("ppg", "ppg", "pts", 0.6),
-        "three_pointers": ("ppg", "ppg", "pts", 0.6),
-        "rebounds":       ("rpg", "rpg", "reb", 0.4),
-        "assists":        ("apg", "apg", "ast", 0.3),
-        "ra":             ("rpg", "rpg", "reb+ast", 0.4),
-    }
-    if high_leverage and clutch_row and prop_type in _CLUTCH_STAT_MAP:
-        c_key, r_key, stat_lbl, abs_cap = _CLUTCH_STAT_MAP[prop_type]
-        c_stat = float(clutch_row.get(c_key) or 0)
-        c_min  = float(clutch_row.get("min") or 0)
-        c_gp   = int(clutch_row.get("gp") or 0)
-        r_stat = float(po.get(r_key) or rs.get(r_key) or 0)
-        r_min  = float(po.get("min") or rs.get("min") or 0)
-        if c_min >= 1.0 and c_gp >= 2 and r_stat > 0 and r_min > 5:
-            c_per_min = c_stat / max(c_min, 0.5)
-            r_per_min = r_stat / max(r_min, 0.5)
-            lift = (c_per_min - r_per_min) / r_per_min if r_per_min > 0 else 0
-            if abs(lift) >= _CLUTCH_LIFT_THRESH:
-                # Apply 50% of the lift, capped by stat type
-                clutch_delta = round(_soft_cap(lift * 0.5, abs_cap), 2)  # sigmoid, was hard ±abs_cap
-                label = "ELEVATES" if lift > 0 else "SHRINKS"
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 11b — PLAYOFF DEBUT FACTOR (zero career PO games this season)
+        # Players making their first playoff appearance historically outperform
+        # regular-season lines. Young/role players especially show adrenaline lift.
+        # Observed May 4 2026: Harper +58%, Champagnie +74% vs model in Game 1.
+        # Stars and veterans excluded (handled by Adj 9 clutch + 11 PO form).
+        # Rules:
+        #   • po_gp == 0 (literally no playoff data this season)
+        #   • rs_gp >= 10 (not a garbage-time player)
+        #   • rs stat for this prop > 0 (has something to project from)
+        #   • role player (rs_ppg < 22) — stars already get elite clutch adj
+        #   → +5% lift (modest — one game is not a trend)
+        # ─────────────────────────────────────────────────────────────────────────
+        debut_pct = 0.0
+        if po_gp_check == 0 and rs_gp_check >= 10:
+            rs_ppg_for_debut = float(rs.get("ppg") or 0)
+            if 3.0 <= rs_ppg_for_debut < 22.0:
+                debut_pct = 0.05
+                debut_abs = round(corr * debut_pct, 2)
                 drivers.append(
-                    f"Clutch Profile (HIGH-LEVERAGE) — {resolved_name.title()} {label} "
-                    f"in clutch ({c_per_min*36:.1f} {stat_lbl}/36 vs {r_per_min*36:.1f} regular, "
-                    f"{c_gp} clutch games). Game-7 boost: {clutch_delta:+.2f}."
+                    f"Playoff Debut — {resolved_name.title()} has 0 career PO games "
+                    f"this season ({rs_gp_check} RS games, {rs_ppg_for_debut:.1f} RS PPG). "
+                    f"First-game adrenaline lift: {debut_pct*100:+.1f}% ({debut_abs:+.2f})."
                 )
-    breakdown["clutchAdj"] = clutch_delta
-    corr = round(corr + clutch_delta, 2)
+        breakdown["debutAdj"] = round(debut_pct * 100, 2)
+        corr = round(corr * (1 + debut_pct), 2)
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 10 — USAGE × EFFICIENCY PROFILE (data-verified)
-    # USG% measures % of team plays that end with this player (shot/TO/FT).
-    # Combined with TS% (true shooting), this tells us:
-    #   • Elite USG (>28%) + good TS (>55%) → +2% (efficient volume scorer)
-    #   • Elite USG (>28%) + low TS (<50%)  → -1.5% (volume inefficiency)
-    # No adjustment for league-average USG to avoid noise.
-    # ─────────────────────────────────────────────────────────────────────────
-    usg_pct_adj = 0.0
-    po_usg = float(po.get("usg") or 0)
-    po_ts  = float(po.get("ts")  or 0)
-    if prop_type in _SCORING_PROPS and po_usg > 0:
-        if po_usg >= _USG_ELITE_THRESH and po_ts >= _TS_GOOD_THRESH:
-            usg_pct_adj = 0.02
-            label = "ELITE-VOLUME EFFICIENT"
-        elif po_usg >= _USG_ELITE_THRESH and po_ts < _TS_BAD_THRESH:
-            usg_pct_adj = -0.015
-            label = "HIGH-VOLUME INEFFICIENT"
-        else:
-            label = None
-        if label:
-            usg_abs = round(corr * usg_pct_adj, 2)
-            drivers.append(
-                f"Usage Profile — {label} ({po_usg:.0f}% USG, {po_ts:.0f}% TS). "
-                f"Impact: {usg_pct_adj*100:+.1f}% ({usg_abs:+.2f})."
-            )
-    breakdown["usageAdj"] = round(usg_pct_adj * 100, 2)
-    corr = round(corr * (1 + usg_pct_adj), 2)
+        # NOTE: Old Adj 12 (Defensive Matchup Type) removed — merged into Adj 2
+        # (Defense Composite EWMA). Keeping adjustment number for reference continuity.
+        breakdown["defMatchAdj"] = 0.0   # legacy key — now included in defCompositeAdj
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 11 — POST-SEASON ELEVATION (data-verified, no client context)
-    # Some players elevate in playoffs (Jimmy Butler, Jokic, Tatum); others
-    # fade. Compares per-game PO production vs RS for the SAME prop type.
-    # Apply 30% of divergence as adjustment. Cap ±6%. Requires PO sample ≥3.
-    # This signal fires for almost every player — captures playoff-specific form.
-    # ─────────────────────────────────────────────────────────────────────────
-    elev_pct = 0.0
-    po_gp_check = int(po.get("gp") or 0)
-    rs_gp_check = int(rs.get("gp") or 0)
-    if po_gp_check >= 3 and rs_gp_check >= 5 and prop_type in ("points","assists","rebounds","pra","pa","pr","ra","steals","blocks"):
-        key_map = {
-            "points":"ppg", "assists":"apg", "rebounds":"rpg",
-            "steals":"spg", "blocks":"bpg",
-            "pra":("ppg","rpg","apg"), "pa":("ppg","apg"), "pr":("ppg","rpg"), "ra":("rpg","apg"),
-        }
-        k = key_map.get(prop_type)
-        if isinstance(k, tuple):
-            po_v = sum(float(po.get(x) or 0) for x in k)
-            rs_v = sum(float(rs.get(x) or 0) for x in k)
-        else:
-            po_v = float(po.get(k) or 0)
-            rs_v = float(rs.get(k) or 0)
-        if po_v > 0 and rs_v > 0:
-            po_lift = (po_v - rs_v) / rs_v
-            if abs(po_lift) >= 0.10:  # ≥10% divergence is meaningful
-                elev_pct = _soft_cap(po_lift * 0.30, 0.06)  # sigmoid, was hard ±6%
-                elev_abs = round(corr * elev_pct, 2)
-                label = "ELEVATING" if po_lift > 0 else "FADING"
-                drivers.append(
-                    f"Playoff Form — {resolved_name.title()} {label} in PO "
-                    f"({po_v:.1f} per game over {po_gp_check} PO games vs "
-                    f"{rs_v:.1f} over {rs_gp_check} RS games, {po_lift*100:+.1f}%). "
-                    f"Impact: {elev_pct*100:+.1f}% ({elev_abs:+.2f})."
-                )
-    breakdown["playoffFormAdj"] = round(elev_pct * 100, 2)
-    corr = round(corr * (1 + elev_pct), 2)
+    else:
+        # XGBoost active — zero out heuristic adjustment breakdown fields
+        for _k in ("astConvAdj","defCompositeAdj","shotProfileAdj","hustleAdj",
+                   "paceAdj","recentFormAdj","restAdj","splitsAdj","clutchAdj",
+                   "usageAdj","playoffFormAdj","debutAdj","defMatchAdj"):
+            breakdown[_k] = 0.0
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # ADJUSTMENT 11b — PLAYOFF DEBUT FACTOR (zero career PO games this season)
-    # Players making their first playoff appearance historically outperform
-    # regular-season lines. Young/role players especially show adrenaline lift.
-    # Observed May 4 2026: Harper +58%, Champagnie +74% vs model in Game 1.
-    # Stars and veterans excluded (handled by Adj 9 clutch + 11 PO form).
-    # Rules:
-    #   • po_gp == 0 (literally no playoff data this season)
-    #   • rs_gp >= 10 (not a garbage-time player)
-    #   • rs stat for this prop > 0 (has something to project from)
-    #   • role player (rs_ppg < 22) — stars already get elite clutch adj
-    #   → +5% lift (modest — one game is not a trend)
-    # ─────────────────────────────────────────────────────────────────────────
-    debut_pct = 0.0
-    if po_gp_check == 0 and rs_gp_check >= 10:
-        rs_ppg_for_debut = float(rs.get("ppg") or 0)
-        if 3.0 <= rs_ppg_for_debut < 22.0:
-            debut_pct = 0.05
-            debut_abs = round(corr * debut_pct, 2)
-            drivers.append(
-                f"Playoff Debut — {resolved_name.title()} has 0 career PO games "
-                f"this season ({rs_gp_check} RS games, {rs_ppg_for_debut:.1f} RS PPG). "
-                f"First-game adrenaline lift: {debut_pct*100:+.1f}% ({debut_abs:+.2f})."
-            )
-    breakdown["debutAdj"] = round(debut_pct * 100, 2)
-    corr = round(corr * (1 + debut_pct), 2)
-
-    # NOTE: Old Adj 12 (Defensive Matchup Type) removed — merged into Adj 2
-    # (Defense Composite EWMA). Keeping adjustment number for reference continuity.
-    breakdown["defMatchAdj"] = 0.0   # legacy key — now included in defCompositeAdj
-
-    # ─────────────────────────────────────────────────────────────────────────
     # ADJUSTMENT 13 — INJURY CASCADE (teammate OUT → usage boost; own GTD → penalty)
     # v6.5.1: Reads from _build_effective_injury_map() instead of static
     # _INJURY_OVERRIDES — so live boxscore clears (auto-cleared playing players)
