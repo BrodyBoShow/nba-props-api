@@ -39,6 +39,7 @@ VAL_SEASONS   = ["2024-25"]
 FEATURE_COLS = [
     "l5_min", "std_min",
     "l10_min_std",
+    "ewma_min",           # EWMA recency — captures recent trend in minutes
     "gp_prior", "is_home", "rest_days",
     "opp_pace_roll10",    # fast-paced game → higher minutes ceiling
     "opp_def_roll10",     # elite defense → closer game → more star minutes

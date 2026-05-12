@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.14.0"  # residual quantile, minutes sub-model, game totals, KNN 4D
+SERVER_VERSION = "v6.15.0"  # EWMA features, inactive_usg_pool, retrained models with 21 features
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -108,7 +108,7 @@ _XGB_LOAD_ERRORS: dict = {}
 _XGB_MIN_MODEL = None    # dedicated minutes-projection sub-model (xgb_min_model.json)
 _XGB_MIN_META:  dict = {}
 _XGB_MIN_FEATURES = [    # must match train_minutes.py FEATURE_COLS
-    "l5_min", "std_min", "l10_min_std",
+    "l5_min", "std_min", "l10_min_std", "ewma_min",
     "gp_prior", "is_home", "rest_days", "opp_pace_roll10", "opp_def_roll10",
 ]
 
@@ -1464,7 +1464,7 @@ def _xgb_predict(prop_key: str, feature_vals: dict) -> dict | None:
         return None
 
 
-def _predict_minutes(l5_min_v, std_min, l10_min_std, gp_prior,
+def _predict_minutes(l5_min_v, std_min, l10_min_std, ewma_min_v, gp_prior,
                      is_home_v, rest_days_v, opp_pace_roll10, opp_def_roll10) -> float | None:
     """
     Use the minutes sub-model to project tonight's minutes.
@@ -1482,6 +1482,7 @@ def _predict_minutes(l5_min_v, std_min, l10_min_std, gp_prior,
             _v(l5_min_v,        "l5_min"),
             _v(std_min,         "std_min"),
             _v(l10_min_std,     "l10_min_std"),
+            _v(ewma_min_v,      "ewma_min"),
             _v(gp_prior,        "gp_prior"),
             _v(is_home_v,       "is_home"),
             _v(rest_days_v,     "rest_days"),
@@ -1510,6 +1511,7 @@ def _build_xgb_features(
     l5_stat_values: list,
     rest_days: int | None,
     is_home: bool | None,
+    inactive_usg_pool: float = 0.0,
 ) -> dict:
     """
     Assemble the feature vector matching the training pipeline columns.
@@ -1520,6 +1522,35 @@ def _build_xgb_features(
     l5_reb = float(po.get("rpg") or po.get("reb") or 0) or None
     l5_ast = float(po.get("apg") or po.get("ast") or 0) or None
     l5_min_v = float(l5_min) if l5_min is not None else float(po.get("min") or 0) or None
+
+    # EWMA features — at live inference we approximate from L5 values.
+    # When game_log_context is available (≥3 entries), compute a proper
+    # exponentially weighted mean with halflife=3 games from the log.
+    # Falls back to l5_* when log is unavailable (model will use median imputation).
+    def _ewma_from_log(log_vals, halflife=3.0):
+        if not log_vals or len(log_vals) < 3:
+            return None
+        try:
+            vals = [float(v) for v in log_vals if v is not None]
+            if len(vals) < 3:
+                return None
+            # Apply exponential decay weights (most recent = highest weight)
+            n = len(vals)
+            weights = [0.5 ** ((n - 1 - i) / halflife) for i in range(n)]
+            total_w = sum(weights)
+            return round(sum(v * w for v, w in zip(vals, weights)) / total_w, 3)
+        except Exception:
+            return None
+
+    # Extract per-stat values from game_log_context if provided
+    _log = l5_stat_values or []   # l5_stat_values is the per-game stat array passed by client
+    ewma_pts = _ewma_from_log(_log) or l5_pts
+    ewma_reb = l5_reb    # reb/ast not sent as game-by-game; use l5 approximation
+    ewma_ast = l5_ast
+    ewma_min_v = None
+    if l5_stat_values and len(l5_stat_values) >= 3:
+        # Approximate EWMA for minutes from l5_min (best available at inference)
+        ewma_min_v = l5_min_v
 
     # L5 TS% from scoring cache
     l5_ts = None
@@ -1574,32 +1605,39 @@ def _build_xgb_features(
     # Project tonight's minutes rather than using the flat historical L5 average.
     # Blowout risk (large spread) and pace effects are already encoded in the model.
     projected_min = _predict_minutes(
-        l5_min_v, std_min, l10_min_std, gp_prior,
+        l5_min_v, std_min, l10_min_std, ewma_min_v, gp_prior,
         is_home_v, rest_days_v, opp_pace_roll10, opp_def_roll10,
     )
     # Use projected if available, fall back to historical l5_min
     effective_min = projected_min if projected_min is not None else l5_min_v
 
     return {
-        "l5_pts":         l5_pts,
-        "l5_reb":         l5_reb,
-        "l5_ast":         l5_ast,
-        "l5_min":         effective_min,   # forward-looking minutes projection
-        "l5_ts":          l5_ts,
-        "l10_pts_std":    l10_pts_std,
-        "l10_min_std":    l10_min_std,
-        "std_pts":        std_pts,
-        "std_reb":        std_reb,
-        "std_ast":        std_ast,
-        "std_min":        std_min,
-        "gp_prior":       gp_prior,
-        "is_home":        is_home_v,
-        "rest_days":      rest_days_v,
-        "opp_def_roll10": opp_def_roll10,
-        "opp_pace_roll10": opp_pace_roll10,
+        "l5_pts":            l5_pts,
+        "l5_reb":            l5_reb,
+        "l5_ast":            l5_ast,
+        "l5_min":            effective_min,   # forward-looking minutes projection
+        "l5_ts":             l5_ts,
+        "l10_pts_std":       l10_pts_std,
+        "l10_min_std":       l10_min_std,
+        "std_pts":           std_pts,
+        "std_reb":           std_reb,
+        "std_ast":           std_ast,
+        "std_min":           std_min,
+        "gp_prior":          gp_prior,
+        "is_home":           is_home_v,
+        "rest_days":         rest_days_v,
+        "opp_def_roll10":    opp_def_roll10,
+        "opp_pace_roll10":   opp_pace_roll10,
+        # EWMA recency features
+        "ewma_pts":          ewma_pts,
+        "ewma_reb":          ewma_reb,
+        "ewma_ast":          ewma_ast,
+        "ewma_min":          ewma_min_v,
+        # Usage redistribution pool
+        "inactive_usg_pool": float(inactive_usg_pool) if inactive_usg_pool else 0.0,
         # Diagnostic — visible in xgb_features_debug
-        "_proj_min":      projected_min,
-        "_hist_min":      l5_min_v,
+        "_proj_min":         projected_min,
+        "_hist_min":         l5_min_v,
     }
 
 
@@ -1924,6 +1962,31 @@ def post_project():
     # When trained model files exist, use ML prediction as the starting point
     # instead of the sequential multiplier cascade. Residual calibration (Adj 14)
     # still fires on top — it corrects any systematic XGBoost bias.
+    # ── Pre-compute inactive_usg_pool for XGBoost feature ────────────────────
+    # Sum the rolling USG proxies of teammates who are OUT tonight.
+    # Uses injury map + players_cache USG rates available at runtime.
+    _inactive_usg_pool = 0.0
+    try:
+        _inj_map_pre, _ = _build_effective_injury_map()
+        _player_team = player.get("team", "").upper()
+        for _tname, _tdata in players_cache.items():
+            if _tname == resolved_name:
+                continue
+            if _tdata.get("team", "").upper() != _player_team:
+                continue
+            _status = _inj_map_pre.get(_tname, "").upper()
+            if _status in ("OUT", "DNP", "INACTIVE"):
+                # USG proxy: FGA + 0.44*FTA + TOV — approximate from player stats
+                _rs = (_cache_get("players") or {}).get("players", {}).get(_tname, {})
+                _usg_approx = (
+                    float(_rs.get("fga") or 0) +
+                    0.44 * float(_rs.get("fta") or 0) +
+                    float(_rs.get("tov") or _rs.get("to") or 0)
+                )
+                _inactive_usg_pool += _usg_approx
+    except Exception:
+        pass
+
     _xgb_prop_key = _XGB_PROP_MAP.get(prop_type)   # None for composites
     _xgb_used     = False
     feats         = {}   # populated by _build_xgb_features; used later by KNN
@@ -1933,6 +1996,7 @@ def post_project():
                 player, po, rs, scoring_row, tracking_row, opp_def,
                 own_team_data, opp_team_data,
                 l5_avg, l5_min, l5_stat_values, rest_days, is_home,
+                inactive_usg_pool=_inactive_usg_pool,
             )
             xgb_out = _xgb_predict(_xgb_prop_key, feats)
             if xgb_out is not None:

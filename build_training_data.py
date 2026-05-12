@@ -97,6 +97,15 @@ def _expanding_prior(series: pd.Series, min_periods: int = 1) -> pd.Series:
     return series.shift(1).expanding(min_periods=min_periods).mean()
 
 
+def _ewma_prior(series: pd.Series, halflife: float = 3.0, min_periods: int = 3) -> pd.Series:
+    """
+    Exponentially weighted mean of prior games.
+    halflife=3 means a game 3 games ago gets 50% the weight of the most recent game.
+    This captures hot/cold streaks better than flat L5/L10 windows.
+    """
+    return series.shift(1).ewm(halflife=halflife, min_periods=min_periods).mean()
+
+
 def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
     """Compute all rolling pre-game features for one player's history."""
     grp = grp.sort_values("GAME_DATE").copy()
@@ -104,7 +113,7 @@ def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
     # Rest days (capped at 14 — bye weeks, start of season get 7)
     grp["rest_days"] = grp["GAME_DATE"].diff().dt.days.fillna(7).clip(upper=14)
 
-    # L5 rolling averages (prior games only)
+    # L5 rolling averages (prior games only — flat window)
     for col, feat in [
         ("PTS",    "l5_pts"),
         ("REB",    "l5_reb"),
@@ -113,6 +122,16 @@ def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
         ("ts_pct", "l5_ts"),
     ]:
         grp[feat] = _rolling_prior(grp[col], 5)
+
+    # EWMA recency features (halflife=3 games — recent form weighted 2× more than 3-game-old)
+    # Captures hot/cold streaks missed by flat L5 averages.
+    for col, feat in [
+        ("PTS", "ewma_pts"),
+        ("REB", "ewma_reb"),
+        ("AST", "ewma_ast"),
+        ("MIN", "ewma_min"),
+    ]:
+        grp[feat] = _ewma_prior(grp[col], halflife=3.0, min_periods=3)
 
     # L10 volatility features
     grp["l10_pts_std"] = _std_prior(grp["PTS"], 10)
@@ -127,10 +146,77 @@ def _per_player(grp: pd.DataFrame) -> pd.DataFrame:
     ]:
         grp[feat] = _expanding_prior(grp[col])
 
+    # USG proxy (numerator of USG% formula) — used for inactive_usg_pool computation
+    if "FGA" in grp.columns and "FTA" in grp.columns and "TOV" in grp.columns:
+        grp["usg_proxy_raw"] = grp["FGA"] + 0.44 * grp["FTA"] + grp["TOV"]
+        grp["l5_usg_proxy"]  = _rolling_prior(grp["usg_proxy_raw"], 5, min_periods=3)
+    else:
+        grp["l5_usg_proxy"] = np.nan
+
     # Games played BEFORE this game in the current season (resets each season)
     grp["gp_prior"] = grp.groupby("season").cumcount()
 
     return grp
+
+
+def _compute_inactive_usg_pool(df: pd.DataFrame) -> pd.Series:
+    """
+    For each player-game, compute the sum of rolling USG proxies of teammates
+    who were expected to play (appeared in any of the last 10 games for that team)
+    but did NOT play (0 MIN or absent from the game log).
+
+    Vectorized implementation — avoids iterrows() for speed on 80k+ rows.
+    """
+    print("  Computing inactive_usg_pool…")
+
+    # Active player set per (GAME_ID, TEAM_ABBREVIATION)
+    played_df = df[df["MIN"] > 0][["GAME_ID", "GAME_DATE", "TEAM_ABBREVIATION", "PLAYER_ID"]].copy()
+    game_team_active = (
+        played_df.groupby(["GAME_ID", "TEAM_ABBREVIATION"])["PLAYER_ID"]
+        .apply(set)
+    )  # Series indexed by (GAME_ID, TEAM_ABBREVIATION)
+
+    # Build expected roster per (TEAM_ABBREVIATION, GAME_DATE) using prior 10 games
+    # Explicit loop per team to avoid pandas 2.x groupby/apply column-dropping issue
+    team_date_active = (
+        played_df.groupby(["TEAM_ABBREVIATION", "GAME_DATE"])["PLAYER_ID"]
+        .apply(set)
+        .reset_index()
+        .rename(columns={"PLAYER_ID": "active_set"})
+    )
+
+    roster_lookup = {}   # (team, game_date) → frozenset of expected player IDs
+    for team, grp in team_date_active.groupby("TEAM_ABBREVIATION"):
+        grp = grp.sort_values("GAME_DATE").reset_index(drop=True)
+        for i in range(len(grp)):
+            prior_sets = grp.iloc[max(0, i - 10):i]["active_set"]
+            roster = frozenset().union(*prior_sets) if len(prior_sets) > 0 else frozenset()
+            roster_lookup[(team, grp.at[i, "GAME_DATE"])] = roster
+
+    # USG proxy lookup: (PLAYER_ID, GAME_DATE) → pre-game rolling USG proxy
+    usg_ser = df.set_index(["PLAYER_ID", "GAME_DATE"])["l5_usg_proxy"].dropna()
+    usg_lookup = usg_ser.to_dict()
+
+    # Vectorized pool computation using numpy arrays
+    teams      = df["TEAM_ABBREVIATION"].values
+    game_ids   = df["GAME_ID"].values
+    player_ids = df["PLAYER_ID"].values
+    dates      = df["GAME_DATE"].values
+
+    pool_values = np.zeros(len(df), dtype=np.float32)
+    for i in range(len(df)):
+        key_team  = (teams[i], dates[i])
+        expected  = roster_lookup.get(key_team, frozenset())
+        if not expected:
+            continue
+        active   = game_team_active.get((game_ids[i], teams[i]), set())
+        inactive = expected - active - {player_ids[i]}
+        pool_values[i] = sum(
+            usg_lookup.get((pid, dates[i]), 0.0) or 0.0
+            for pid in inactive
+        )
+
+    return pd.Series(pool_values, index=df.index, name="inactive_usg_pool")
 
 
 def main():
@@ -210,6 +296,13 @@ def main():
     # ── 5. Join opponent context ───────────────────────────────────────────────
     raw = raw.merge(opp_lookup, on=["GAME_ID", "TEAM_ABBREVIATION"], how="left")
 
+    # ── 5b. Compute inactive_usg_pool ─────────────────────────────────────────
+    # Must run AFTER per-player features (needs l5_usg_proxy) and AFTER opp join.
+    raw["inactive_usg_pool"] = _compute_inactive_usg_pool(raw)
+    print(f"  inactive_usg_pool: mean={raw['inactive_usg_pool'].mean():.2f}  "
+          f"max={raw['inactive_usg_pool'].max():.2f}  "
+          f"non-zero={( raw['inactive_usg_pool'] > 0).mean():.1%}")
+
     # ── 6. Define targets ─────────────────────────────────────────────────────
     raw["target_pts"] = raw["PTS"]
     raw["target_reb"] = raw["REB"]
@@ -220,13 +313,17 @@ def main():
         # Identifiers
         "PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "GAME_ID", "GAME_DATE",
         "season", "season_type",
-        # Pre-game features
+        # Pre-game features — flat windows
         "is_home", "rest_days",
         "l5_pts", "l5_reb", "l5_ast", "l5_min", "l5_ts",
         "l10_pts_std", "l10_min_std",
         "std_pts", "std_reb", "std_ast", "std_min",
         "gp_prior",
         "opp_def_roll10", "opp_pace_roll10",
+        # EWMA recency features (new — halflife=3 games)
+        "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
+        # Usage redistribution pool (new — sum of absent teammates' USG proxy)
+        "inactive_usg_pool",
         # Targets
         "target_pts", "target_reb", "target_ast",
         # Keep actual MIN for analysis — NOT a training feature (future leakage)
@@ -241,8 +338,10 @@ def main():
     print(f"Seasons:    {sorted(out['season'].unique())}")
     print(f"Players:    {out['PLAYER_ID'].nunique():,}")
     print(f"\nNaN counts in key features:")
-    feat_cols = ["l5_pts", "l5_reb", "l5_ast", "l5_min", "opp_def_roll10", "opp_pace_roll10"]
-    print(out[feat_cols].isna().sum().to_string())
+    feat_cols = ["l5_pts", "l5_reb", "l5_ast", "l5_min",
+                 "ewma_pts", "ewma_reb", "ewma_ast",
+                 "inactive_usg_pool", "opp_def_roll10", "opp_pace_roll10"]
+    print(out[[c for c in feat_cols if c in out.columns]].isna().sum().to_string())
 
     out.to_parquet(OUTPUT_FILE, index=False)
     print(f"\nSaved → {OUTPUT_FILE}")
@@ -254,6 +353,9 @@ def main():
         "std_pts", "std_reb", "std_ast", "std_min",
         "gp_prior", "is_home", "rest_days",
         "opp_def_roll10", "opp_pace_roll10",
+        # New features
+        "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
+        "inactive_usg_pool",
     ]
     medians = {c: float(out[c].median()) for c in feature_cols if c in out.columns}
     meta = {"feature_cols": feature_cols, "medians": medians}
