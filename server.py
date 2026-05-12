@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.11.0-xgb-pure"  # gate Adj 1-12 when XGBoost active (no double-counting)
+SERVER_VERSION = "v6.11.1-quantile-ready"  # quantile model loader + adj gate + q25/q50/q75 in response
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -98,28 +98,32 @@ SEASON = "2025-26"
 _CACHE_TTL = 3600  # 1 hour (default; see _dynamic_ttl for time-aware values)
 
 # ── XGBoost model registry ────────────────────────────────────────────────────
-# Populated by _load_xgb_models() during warmup. Keys: "pts", "reb", "ast".
-_XGB_MODELS: dict = {}
-_XGB_META:   dict = {}   # feature_cols + medians loaded from model_meta.json
-_XGB_LOAD_ERRORS: dict = {}  # prop -> error string for diagnostics
+# Populated by _load_xgb_models() during warmup.
+# _XGB_MODELS["pts"]      → Poisson point-estimate model
+# _XGB_QUANTILE["pts"]["q25/q50/q75"] → quantile models (may be absent on old deploys)
+_XGB_MODELS:   dict = {}
+_XGB_QUANTILE: dict = {}   # { "pts": {"q25": model, "q50": model, "q75": model}, ... }
+_XGB_META:     dict = {}
+_XGB_LOAD_ERRORS: dict = {}
 
 _XGB_PROP_MAP = {
     "points":     "pts",
     "rebounds":   "reb",
     "assists":    "ast",
-    "pra":        None,  # composite — handled separately
+    "pra":        None,
     "pa":         None,
     "pr":         None,
 }
 
 def _load_xgb_models():
-    """Load trained XGBoost model files and metadata from disk into memory."""
-    global _XGB_MODELS, _XGB_META
+    """Load Poisson + quantile XGBoost model files and metadata from disk."""
+    global _XGB_MODELS, _XGB_QUANTILE, _XGB_META
     if not _XGB_AVAILABLE:
         logging.info("XGBoost not installed — running multiplier-only mode.")
         return
 
-    meta_path = os.path.join(os.path.dirname(__file__), "model_meta.json")
+    base = os.path.dirname(__file__)
+    meta_path = os.path.join(base, "model_meta.json")
     if not os.path.exists(meta_path):
         logging.info("model_meta.json not found — XGBoost inference disabled.")
         return
@@ -129,20 +133,36 @@ def _load_xgb_models():
 
     loaded = []
     for prop in ("pts", "reb", "ast"):
-        model_path = os.path.join(os.path.dirname(__file__), f"xgb_{prop}_model.json")
-        if not os.path.exists(model_path):
-            logging.warning("XGB model file missing: %s", model_path)
+        # Primary Poisson model
+        mp = os.path.join(base, f"xgb_{prop}_model.json")
+        if not os.path.exists(mp):
+            logging.warning("XGB model file missing: %s", mp)
             continue
         try:
             m = _xgb_lib.XGBRegressor()
-            m.load_model(model_path)
+            m.load_model(mp)
             _XGB_MODELS[prop] = m
             loaded.append(prop)
         except Exception as e:
-            import traceback
             err = f"{type(e).__name__}: {e}"
             _XGB_LOAD_ERRORS[prop] = err
-            logging.error("XGB %s model load failed: %s\n%s", prop, err, traceback.format_exc())
+            logging.error("XGB %s load failed: %s", prop, err)
+
+        # Quantile models (q25 / q50 / q75) — optional, present after retrain
+        _XGB_QUANTILE[prop] = {}
+        for tag in ("q25", "q50", "q75"):
+            qp = os.path.join(base, f"xgb_{prop}_{tag}.json")
+            if not os.path.exists(qp):
+                continue
+            try:
+                qm = _xgb_lib.XGBRegressor()
+                qm.load_model(qp)
+                _XGB_QUANTILE[prop][tag] = qm
+            except Exception as e:
+                logging.warning("XGB %s %s load failed: %s", prop, tag, e)
+
+        if _XGB_QUANTILE.get(prop):
+            logging.info("XGB %s quantile models loaded: %s", prop, list(_XGB_QUANTILE[prop]))
 
     logging.info("XGBoost models loaded: %s (xgb v%s)",
                  loaded or "none", getattr(_xgb_lib, "__version__", "?"))
@@ -1293,16 +1313,16 @@ def _base_stat(po, rs, prop_type, scoring_row=None, l5_avg=None,
     return base, False   # use_rate_base=False → caller lets Adj 5 fire normally
 
 
-def _xgb_predict(prop_key: str, feature_vals: dict) -> float | None:
+def _xgb_predict(prop_key: str, feature_vals: dict) -> dict | None:
     """
     Run XGBoost inference for one player-game.
 
-    Args:
-        prop_key:     "pts" | "reb" | "ast"
-        feature_vals: dict of raw feature values (may contain None/NaN)
-
-    Returns:
-        float prediction, or None if model unavailable / features insufficient.
+    Returns dict with keys:
+        point  — Poisson point estimate (primary corr base)
+        q25    — 25th-percentile quantile model output (floor)
+        q50    — 50th-percentile fair line (median, bypasses parametric adjustment)
+        q75    — 75th-percentile (ceiling)
+    Or None if model unavailable.
     """
     model = _XGB_MODELS.get(prop_key)
     if model is None or not _XGB_META:
@@ -1323,10 +1343,17 @@ def _xgb_predict(prop_key: str, feature_vals: dict) -> float | None:
 
     try:
         df_row = pd.DataFrame([row], columns=feature_cols)
-        pred   = float(model.predict(df_row)[0])
-        return max(0.0, round(pred, 2))
+        point  = max(0.0, round(float(model.predict(df_row)[0]), 2))
+
+        # Quantile predictions (available after retrain; degrade gracefully if absent)
+        q_models = _XGB_QUANTILE.get(prop_key, {})
+        q25 = max(0.0, round(float(q_models["q25"].predict(df_row)[0]), 2)) if "q25" in q_models else None
+        q50 = max(0.0, round(float(q_models["q50"].predict(df_row)[0]), 2)) if "q50" in q_models else None
+        q75 = max(0.0, round(float(q_models["q75"].predict(df_row)[0]), 2)) if "q75" in q_models else None
+
+        return {"point": point, "q25": q25, "q50": q50, "q75": q75}
     except Exception as e:
-        logging.warning("XGBoost predict failed (%s/%s): %s", prop_key, feature_vals.get("l5_pts"), e)
+        logging.warning("XGBoost predict failed (%s): %s", prop_key, e)
         return None
 
 
@@ -1632,14 +1659,20 @@ def post_project():
                 own_team_data, opp_team_data,
                 l5_avg, l5_min, l5_stat_values, rest_days, is_home,
             )
-            xgb_pred = _xgb_predict(_xgb_prop_key, feats)
+            xgb_out = _xgb_predict(_xgb_prop_key, feats)
+            if xgb_out is not None:
+                xgb_pred = xgb_out["point"]   # Poisson point estimate drives corr
+                xgb_q50  = xgb_out.get("q50") # true median fair line (may be None pre-retrain)
+                xgb_q25  = xgb_out.get("q25")
+                xgb_q75  = xgb_out.get("q75")
+            else:
+                xgb_pred = xgb_q50 = xgb_q25 = xgb_q75 = None
+
             if xgb_pred is not None and xgb_pred > 0:
                 ev_vs_base = round((xgb_pred / base - 1) * 100, 1) if base else 0
-                # Guardrail: reject XGBoost if it deviates >35% from historical base.
-                # Extreme deviation signals feature drift (e.g. wrong-scale inputs).
                 if base and abs(ev_vs_base) > 35:
                     logging.warning(
-                        "XGBoost prediction %.2f rejected — %.1f%% deviation from base %.2f",
+                        "XGBoost prediction %.2f rejected — %.1f%% from base %.2f",
                         xgb_pred, ev_vs_base, base,
                     )
                     breakdown["xgb_rejected"] = True
@@ -1653,14 +1686,17 @@ def post_project():
                     l5_display = feats.get("l5_pts") or feats.get("l5_reb") or feats.get("l5_ast")
                     l5_str = f"{l5_display:.1f}" if l5_display else "?"
                     opp_str = feats.get("opp_def_roll10") or "?"
+                    q_str = f" | q25={xgb_q25} q50={xgb_q50} q75={xgb_q75}" if xgb_q50 else ""
                     drivers.append(
-                        f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred:.1f}) "
-                        f"replaces heuristic multiplier cascade. "
-                        f"Delta vs historical base: {ev_vs_base:+.1f}% "
+                        f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred:.1f}{q_str}) "
+                        f"replaces heuristic cascade. Delta vs historical base: {ev_vs_base:+.1f}% "
                         f"(l5={l5_str}, opp_def={opp_str})."
                     )
-                    breakdown["xgb_base"] = round(xgb_pred, 2)
+                    breakdown["xgb_base"]             = round(xgb_pred, 2)
                     breakdown["xgb_vs_heuristic_pct"] = ev_vs_base
+                    breakdown["xgb_q25"]              = xgb_q25
+                    breakdown["xgb_q50"]              = xgb_q50   # true fair line
+                    breakdown["xgb_q75"]              = xgb_q75
         except Exception as _xe:
             logging.warning("XGBoost inference error: %s", _xe)
     breakdown["xgb_active"] = _xgb_used
@@ -3071,6 +3107,7 @@ def model_status():
         "xgb_available":    _XGB_AVAILABLE,
         "xgb_version":      xgb_ver,
         "models_loaded":    list(_XGB_MODELS.keys()),
+        "quantile_models":  {p: list(q.keys()) for p, q in _XGB_QUANTILE.items() if q},
         "load_errors":      _XGB_LOAD_ERRORS,
         "file_check":       file_check,
         "feature_cols":     _XGB_META.get("feature_cols", []),
