@@ -56,6 +56,14 @@ FEATURE_COLS = [
     "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
     # Usage redistribution pool (sum of absent teammates' rolling USG proxy)
     "inactive_usg_pool",
+    # Tracking-derived features — box-score proxies at training, real values at inference
+    # fg3_vs_avg:        rolling opp 3PA/FGA rate - 0.37  (perimeter D quality)
+    # rim_vs_avg:        rolling opp FG% - 0.47            (interior D quality)
+    # efficiency_delta:  l5_ts - league_avg at training; l5_ts - xPPS at inference
+    # l5_potential_ast:  l5_ast × 3.33 at training; real potentialAst/g at inference
+    "fg3_vs_avg", "rim_vs_avg",
+    "efficiency_delta",
+    "l5_potential_ast",
 ]
 
 TARGETS = {

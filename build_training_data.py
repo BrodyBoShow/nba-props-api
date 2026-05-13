@@ -260,17 +260,20 @@ def main():
 
     # ── 3. Build opponent defensive efficiency proxy ───────────────────────────
     # Aggregate player logs to team totals per game
-    team_game = (
-        raw.groupby(["GAME_ID", "TEAM_ABBREVIATION", "GAME_DATE"])
-        .agg(team_pts=("PTS", "sum"), team_fga=("FGA", "sum"))
-        .reset_index()
-    )
+    agg_cols = {"team_pts": ("PTS", "sum"), "team_fga": ("FGA", "sum")}
+    if "FG3A" in raw.columns:
+        agg_cols["team_fg3a"] = ("FG3A", "sum")
+    if "FGM" in raw.columns:
+        agg_cols["team_fgm"] = ("FGM", "sum")
+    team_game = raw.groupby(["GAME_ID", "TEAM_ABBREVIATION", "GAME_DATE"]).agg(**agg_cols).reset_index()
 
-    # Self-join: each team row gets the opponent's PTS (= pts they allowed)
-    tg = team_game.merge(
-        team_game[["GAME_ID", "TEAM_ABBREVIATION", "team_pts", "team_fga"]],
-        on="GAME_ID", suffixes=("", "_opp")
-    )
+    # Self-join: each team row gets the opponent's stats (= what this team allowed)
+    join_cols = ["GAME_ID", "TEAM_ABBREVIATION", "team_pts", "team_fga"]
+    if "team_fg3a" in team_game.columns:
+        join_cols.append("team_fg3a")
+    if "team_fgm" in team_game.columns:
+        join_cols.append("team_fgm")
+    tg = team_game.merge(team_game[join_cols], on="GAME_ID", suffixes=("", "_opp"))
     tg = tg[tg["TEAM_ABBREVIATION"] != tg["TEAM_ABBREVIATION_opp"]].copy()
     tg = tg.rename(columns={"team_pts_opp": "pts_allowed", "team_fga_opp": "opp_fga"})
     tg = tg.sort_values(["TEAM_ABBREVIATION", "GAME_DATE"])
@@ -283,8 +286,34 @@ def main():
         lambda x: x.shift(1).rolling(10, min_periods=3).mean()
     )
 
+    # fg3_vs_avg proxy: rolling opponent 3PA/FGA rate vs league average.
+    # Positive = team allows more 3PA (weak perimeter D); negative = fewer 3PA.
+    # rim_vs_avg proxy: rolling opponent FG% vs league average.
+    # Positive = team allows higher FG% (weak interior D); negative = stronger D.
+    # NOTE: after the rename above, "opp_fga" = what this team's opponent attempted.
+    #       "team_fg3a_opp" and "team_fgm_opp" are still the un-renamed suffix columns.
+    _LEAGUE_AVG_FG3A_RATE = 0.37   # ~37% of FGA are 3PA in 2024-25 NBA
+    _LEAGUE_AVG_FG_PCT    = 0.470  # ~47% overall FG% in 2024-25 NBA
+    if "team_fg3a_opp" in tg.columns:
+        tg["opp_fg3a_rate"] = tg["team_fg3a_opp"] / tg["opp_fga"].replace(0, np.nan)
+        tg["fg3_vs_avg"] = tg.groupby("TEAM_ABBREVIATION")["opp_fg3a_rate"].transform(
+            lambda x: x.shift(1).rolling(10, min_periods=3).mean()
+        ) - _LEAGUE_AVG_FG3A_RATE
+    else:
+        tg["fg3_vs_avg"] = np.nan
+
+    if "team_fgm_opp" in tg.columns:
+        tg["opp_fgpct"] = tg["team_fgm_opp"] / tg["opp_fga"].replace(0, np.nan)
+        tg["rim_vs_avg"] = tg.groupby("TEAM_ABBREVIATION")["opp_fgpct"].transform(
+            lambda x: x.shift(1).rolling(10, min_periods=3).mean()
+        ) - _LEAGUE_AVG_FG_PCT
+    else:
+        tg["rim_vs_avg"] = np.nan
+
     # Lookup table: game_id + player team → rolling opponent defensive stats
-    opp_lookup = tg[["GAME_ID", "TEAM_ABBREVIATION", "opp_def_roll10", "opp_pace_roll10"]].copy()
+    opp_lookup_cols = ["GAME_ID", "TEAM_ABBREVIATION", "opp_def_roll10", "opp_pace_roll10",
+                       "fg3_vs_avg", "rim_vs_avg"]
+    opp_lookup = tg[[c for c in opp_lookup_cols if c in tg.columns]].copy()
 
     # ── 4. Per-player rolling features ────────────────────────────────────────
     # Explicit loop avoids pandas 2.x groupby/apply key-dropping behaviour.
@@ -302,6 +331,16 @@ def main():
     print(f"  inactive_usg_pool: mean={raw['inactive_usg_pool'].mean():.2f}  "
           f"max={raw['inactive_usg_pool'].max():.2f}  "
           f"non-zero={( raw['inactive_usg_pool'] > 0).mean():.1%}")
+
+    # ── 5c. Tracking-derived ML feature proxies ────────────────────────────────
+    # efficiency_delta: player's L5 TS% vs NBA average (proxy for shot quality delta).
+    # At inference, replaced by actual (l5_ts - xPPS) computed from tracking splits.
+    _LEAGUE_AVG_TS = 0.559   # 2024-25 NBA avg TS% — used as training baseline
+    raw["efficiency_delta"] = (raw["l5_ts"] - _LEAGUE_AVG_TS).fillna(0.0)
+
+    # l5_potential_ast: creation volume proxy = l5_ast × 3.33 (AST/potAST ≈ 0.30 NBA avg).
+    # At inference, replaced by actual potentialAst/g from passing tracking endpoint.
+    raw["l5_potential_ast"] = (raw["l5_ast"] * 3.33).fillna(0.0)
 
     # ── 6. Define targets ─────────────────────────────────────────────────────
     raw["target_pts"] = raw["PTS"]
@@ -324,6 +363,10 @@ def main():
         "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
         # Usage redistribution pool (new — sum of absent teammates' USG proxy)
         "inactive_usg_pool",
+        # Tracking-derived features (proxied from box-score for training)
+        "fg3_vs_avg", "rim_vs_avg",       # opponent scheme concessions
+        "efficiency_delta",               # player TS% vs expected (shot quality)
+        "l5_potential_ast",               # creation volume proxy
         # Targets
         "target_pts", "target_reb", "target_ast",
         # Keep actual MIN for analysis — NOT a training feature (future leakage)
@@ -353,9 +396,12 @@ def main():
         "std_pts", "std_reb", "std_ast", "std_min",
         "gp_prior", "is_home", "rest_days",
         "opp_def_roll10", "opp_pace_roll10",
-        # New features
         "ewma_pts", "ewma_reb", "ewma_ast", "ewma_min",
         "inactive_usg_pool",
+        # Tracking-derived features (proxied at training; real values at inference)
+        "fg3_vs_avg", "rim_vs_avg",
+        "efficiency_delta",
+        "l5_potential_ast",
     ]
     medians = {c: float(out[c].median()) for c in feature_cols if c in out.columns}
     meta = {"feature_cols": feature_cols, "medians": medians}

@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.19.1"  # fix: shot-quality unconditional — ±1.5% cap w/ XGB, ±3% heuristic; always visible in drivers
+SERVER_VERSION = "v6.20.0"  # feat: tracking features native to XGBoost — efficiency_delta, fg3/rim_vs_avg, l5_potential_ast; retrained all models
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1672,6 +1672,56 @@ def _build_xgb_features(
         if pts_allowed is not None:
             opp_def_roll10 = float(pts_allowed)
 
+    # ── Tracking-derived ML features ─────────────────────────────────────────
+    # These mirror the training proxies in build_training_data.py but use the
+    # real NBA.com tracking values at inference — richer signal than the proxy.
+
+    # efficiency_delta: player's actual TS% vs expected TS% from shot-difficulty.
+    # xPPS = expected pts per shot from weighted drive/pullup/catch-shoot FG%.
+    # Positive = player over-performing their shot mix; negative = under-performing.
+    _LEAGUE_AVG_TS_TRAIN = 0.559   # 2024-25 NBA avg TS% — matches training proxy baseline
+    efficiency_delta = None
+    if l5_ts is not None:
+        if tracking_row:
+            _d_fga  = float(tracking_row.get("driveFga",        0) or 0)
+            _pu_fga = float(tracking_row.get("pullUpFga",       0) or 0)
+            _cs_fga = float(tracking_row.get("catchShootFga",   0) or 0)
+            _t_fga  = _d_fga + _pu_fga + _cs_fga
+            if _t_fga >= 1.0:
+                _xpps = 2.0 * (
+                    (_d_fga  / _t_fga) * float(tracking_row.get("driveFgPct",       0) or 0) +
+                    (_pu_fga / _t_fga) * float(tracking_row.get("pullUpEfgPct",     0) or 0) +
+                    (_cs_fga / _t_fga) * float(tracking_row.get("catchShootEfgPct", 0) or 0)
+                )
+                if _xpps > 0:
+                    efficiency_delta = round(float(l5_ts) - _xpps, 4)
+        if efficiency_delta is None:
+            # Fallback: compare to league-average TS% (same as training proxy)
+            efficiency_delta = round(float(l5_ts) - _LEAGUE_AVG_TS_TRAIN, 4)
+
+    # fg3_vs_avg / rim_vs_avg: opponent's 3pt and rim concession vs league avg.
+    # Positive fg3_vs_avg = allows more 3s = weak perimeter D = more scoring.
+    # Positive rim_vs_avg = allows higher rim FG% = weak paint D = more scoring.
+    feat_fg3_vs_avg = None
+    feat_rim_vs_avg = None
+    if opp_def:
+        _fg3 = opp_def.get("fg3VsAvg")
+        _rim = opp_def.get("rimVsAvg")
+        if _fg3 is not None:
+            feat_fg3_vs_avg = float(_fg3)
+        if _rim is not None:
+            feat_rim_vs_avg = float(_rim)
+
+    # l5_potential_ast: creation volume from tracking. At inference: real potentialAst/g.
+    # Training proxy = l5_ast × 3.33 (league-avg AST/potentialAST ≈ 0.30).
+    l5_potential_ast = None
+    if tracking_row:
+        _pa = float(tracking_row.get("potentialAst", 0) or 0)
+        if _pa > 0:
+            l5_potential_ast = _pa
+    if l5_potential_ast is None and l5_ast is not None:
+        l5_potential_ast = round(float(l5_ast) * 3.33, 2)  # proxy fallback
+
     # ── Minutes sub-model override ────────────────────────────────────────────
     # Project tonight's minutes rather than using the flat historical L5 average.
     # Blowout risk (large spread) and pace effects are already encoded in the model.
@@ -1706,6 +1756,14 @@ def _build_xgb_features(
         "ewma_min":          ewma_min_v,
         # Usage redistribution pool
         "inactive_usg_pool": float(inactive_usg_pool) if inactive_usg_pool else 0.0,
+        # ── Tracking-derived features (new — require retrained models to activate) ──
+        # efficiency_delta: player TS% vs shot-difficulty-adjusted xPPS (or vs league avg)
+        "efficiency_delta":  efficiency_delta,
+        # Opponent scheme concessions from LeagueDashPtTeamDefend
+        "fg3_vs_avg":        feat_fg3_vs_avg,
+        "rim_vs_avg":        feat_rim_vs_avg,
+        # Assist creation volume from passing tracking
+        "l5_potential_ast":  l5_potential_ast,
         # Diagnostic — visible in xgb_features_debug
         "_proj_min":         projected_min,
         "_hist_min":         l5_min_v,
@@ -2102,10 +2160,21 @@ def post_project():
                     l5_str = f"{l5_display:.1f}" if l5_display else "?"
                     opp_str = feats.get("opp_def_roll10") or "?"
                     q_str = f" | q25={xgb_q25} q50={xgb_q50} q75={xgb_q75}" if xgb_q50 else ""
+                    # Surface tracking features that fed the model natively
+                    _eff_d  = feats.get("efficiency_delta")
+                    _fg3    = feats.get("fg3_vs_avg")
+                    _rim    = feats.get("rim_vs_avg")
+                    _potast = feats.get("l5_potential_ast")
+                    _track_parts = []
+                    if _eff_d  is not None: _track_parts.append(f"eff_delta={_eff_d:+.3f}")
+                    if _fg3    is not None: _track_parts.append(f"opp_fg3={_fg3:+.3f}")
+                    if _rim    is not None: _track_parts.append(f"opp_rim={_rim:+.3f}")
+                    if _potast is not None: _track_parts.append(f"potAST={_potast:.1f}")
+                    _track_str = f" | tracking: {', '.join(_track_parts)}" if _track_parts else ""
                     drivers.append(
                         f"XGBoost ML Base — gradient-boosted prediction ({xgb_pred:.1f}{q_str}) "
                         f"replaces heuristic cascade. Delta vs historical base: {ev_vs_base:+.1f}% "
-                        f"(l5={l5_str}, opp_def={opp_str})."
+                        f"(l5={l5_str}, opp_def={opp_str}{_track_str})."
                     )
                     breakdown["xgb_base"]             = round(xgb_pred, 2)
                     breakdown["xgb_vs_heuristic_pct"] = ev_vs_base
@@ -2577,13 +2646,12 @@ def post_project():
                    "usageAdj","playoffFormAdj","debutAdj","defMatchAdj"):
             breakdown[_k] = 0.0
 
-    # ADJUSTMENT 4b — SHOT QUALITY (points props, unconditional)
-    # When XGBoost is active: tight ±1.5% cap — tracking provides supplementary signal
-    # not encoded in XGB features (drive/pullup/catch-shoot split efficiency).
-    # When heuristic base: full ±3% cap for stronger calibration.
-    # Always fires so tracking context appears in the drivers/analysis output.
+    # ADJUSTMENT 4b — SHOT QUALITY (points props, heuristic path only)
+    # When XGBoost is active: efficiency_delta is a native model feature — applying
+    # this adjustment on top would double-count. Model handles it natively.
+    # When heuristic base only: full ±3% cap for standalone calibration.
     shot_qual_adj = 0.0
-    if prop_type in _SCORING_PROPS and tracking_row:
+    if not _xgb_used and prop_type in _SCORING_PROPS and tracking_row:
         drive_fga  = float(tracking_row.get("driveFga",         0) or 0)
         pullup_fga = float(tracking_row.get("pullUpFga",         0) or 0)
         cs_fga     = float(tracking_row.get("catchShootFga",     0) or 0)
