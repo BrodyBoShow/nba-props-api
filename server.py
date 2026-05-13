@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.18.0"  # feat: shot-quality tracking adj for points props (drives, pull-up, catch-shoot EFG%)
+SERVER_VERSION = "v6.18.1"  # fix: shot-quality adj moved outside xgb gate — was skipped when XGBoost active
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2285,44 +2285,6 @@ def post_project():
         corr = round(corr + hustle_delta, 1)
 
         # ─────────────────────────────────────────────────────────────────────────
-        # ADJUSTMENT 4b — SHOT QUALITY (points props only)
-        # Weighted efficiency delta across three tracked shot categories:
-        #   Drives (FG%), Pull-up (EFG%), Catch-&-Shoot (EFG%)
-        # Weight = each category's FGA share of total tracked FGA.
-        # +1% efficiency edge = roughly +0.3 pts at league-avg volume.
-        # Soft-capped at ±8%.
-        # ─────────────────────────────────────────────────────────────────────────
-        shot_qual_adj = 0.0
-        if prop_type in _SCORING_PROPS and tracking_row:
-            drive_fga  = float(tracking_row.get("driveFga",         0) or 0)
-            pullup_fga = float(tracking_row.get("pullUpFga",         0) or 0)
-            cs_fga     = float(tracking_row.get("catchShootFga",     0) or 0)
-            total_fga  = drive_fga + pullup_fga + cs_fga
-            if total_fga >= 2.0:
-                drive_eff  = float(tracking_row.get("driveFgPct",        0) or 0)
-                pullup_eff = float(tracking_row.get("pullUpEfgPct",       0) or 0)
-                cs_eff     = float(tracking_row.get("catchShootEfgPct",   0) or 0)
-                eff_delta  = (
-                    (drive_eff  - _LEAGUE_AVG_DRIVE_FG_PCT)   * (drive_fga  / total_fga) +
-                    (pullup_eff - _LEAGUE_AVG_PULLUP_EFG_PCT)  * (pullup_fga / total_fga) +
-                    (cs_eff     - _LEAGUE_AVG_CS_EFG_PCT)      * (cs_fga     / total_fga)
-                )
-                shot_qual_pct = _soft_cap(eff_delta, _SHOT_QUAL_CAP)
-                shot_qual_adj = round(corr * shot_qual_pct, 2)
-                if abs(shot_qual_pct) >= 0.005:
-                    direction = "ABOVE" if eff_delta > 0 else "BELOW"
-                    drivers.append(
-                        f"Shot Quality — {resolved_name.title()} shoots "
-                        f"{abs(eff_delta)*100:.1f}% {direction} league avg "
-                        f"across drives ({drive_eff:.1%} FG%), "
-                        f"pull-ups ({pullup_eff:.1%} EFG%), "
-                        f"catch-&-shoot ({cs_eff:.1%} EFG%). "
-                        f"Impact: {shot_qual_adj:+.2f} pts."
-                    )
-        breakdown["shotQualAdj"] = shot_qual_adj
-        corr = round(corr + shot_qual_adj, 2)
-
-        # ─────────────────────────────────────────────────────────────────────────
         # ADJUSTMENT 5 — PACE CONTEXT
         # When use_rate_base=True, pace is already baked into projected_minutes inside
         # _base_stat (Rate×Minutes baseline). Firing Adj 5 on top would double-count it.
@@ -2613,6 +2575,39 @@ def post_project():
                    "paceAdj","recentFormAdj","restAdj","splitsAdj","clutchAdj",
                    "usageAdj","playoffFormAdj","debutAdj","defMatchAdj"):
             breakdown[_k] = 0.0
+
+    # ADJUSTMENT 4b — SHOT QUALITY (points props, always fires — XGBoost doesn't encode EFG% by shot type)
+    # Weighted efficiency delta across drives (FG%), pull-ups (EFG%), catch-&-shoot (EFG%).
+    # Weight = each category's FGA share of total tracked FGA. Soft-capped at ±8%.
+    shot_qual_adj = 0.0
+    if prop_type in _SCORING_PROPS and tracking_row:
+        drive_fga  = float(tracking_row.get("driveFga",         0) or 0)
+        pullup_fga = float(tracking_row.get("pullUpFga",         0) or 0)
+        cs_fga     = float(tracking_row.get("catchShootFga",     0) or 0)
+        total_fga  = drive_fga + pullup_fga + cs_fga
+        if total_fga >= 2.0:
+            drive_eff  = float(tracking_row.get("driveFgPct",        0) or 0)
+            pullup_eff = float(tracking_row.get("pullUpEfgPct",       0) or 0)
+            cs_eff     = float(tracking_row.get("catchShootEfgPct",   0) or 0)
+            eff_delta  = (
+                (drive_eff  - _LEAGUE_AVG_DRIVE_FG_PCT)   * (drive_fga  / total_fga) +
+                (pullup_eff - _LEAGUE_AVG_PULLUP_EFG_PCT)  * (pullup_fga / total_fga) +
+                (cs_eff     - _LEAGUE_AVG_CS_EFG_PCT)      * (cs_fga     / total_fga)
+            )
+            shot_qual_pct = _soft_cap(eff_delta, _SHOT_QUAL_CAP)
+            shot_qual_adj = round(corr * shot_qual_pct, 2)
+            if abs(shot_qual_pct) >= 0.005:
+                direction = "ABOVE" if eff_delta > 0 else "BELOW"
+                drivers.append(
+                    f"Shot Quality — {resolved_name.title()} shoots "
+                    f"{abs(eff_delta)*100:.1f}% {direction} league avg "
+                    f"across drives ({drive_eff:.1%} FG%), "
+                    f"pull-ups ({pullup_eff:.1%} EFG%), "
+                    f"catch-&-shoot ({cs_eff:.1%} EFG%). "
+                    f"Impact: {shot_qual_adj:+.2f} pts."
+                )
+    breakdown["shotQualAdj"] = shot_qual_adj
+    corr = round(corr + shot_qual_adj, 2)
 
     # ADJUSTMENT 13 — INJURY CASCADE (teammate OUT → usage boost; own GTD → penalty)
     # v6.5.1: Reads from _build_effective_injury_map() instead of static
