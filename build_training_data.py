@@ -51,7 +51,10 @@ SEASON_PRIOR = {
 }
 _TRACKING_MEASURE_TYPES = ["Drives", "PullUpShot", "CatchShoot", "Passing"]
 
-_LEAGUE_AVG_TS_TRAIN = 0.559   # 2024-25 NBA avg TS% — xPPS fallback baseline
+_LEAGUE_AVG_TS_TRAIN        = 0.559   # 2024-25 NBA avg TS% — xPPS fallback baseline
+_LEAGUE_AVG_DRIVE_FG_PCT    = 0.477   # FGA-weighted drive FG%      (matches server.py)
+_LEAGUE_AVG_PULLUP_EFG_PCT  = 0.451   # FGA-weighted pull-up EFG%   (matches server.py)
+_LEAGUE_AVG_CS_EFG_PCT      = 0.531   # FGA-weighted catch-&-shoot EFG% (matches server.py)
 
 
 def _fetch(season: str, season_type: str, retries: int = 3) -> pd.DataFrame:
@@ -158,11 +161,12 @@ def _build_tracking_prior_lookup() -> dict:
             t_fga  = d_fga + pu_fga + cs_fga
 
             if t_fga > 0:
-                d_eff  = float(d.get("DRIVE_FG_PCT",          0) or 0)
-                pu_eff = float(pu.get("PULL_UP_EFG_PCT",       0) or 0)
-                cs_eff = float(c.get("CATCH_SHOOT_EFG_PCT",    0) or 0)
-                # Weighted harmonic of tracked shot efficiency — same formula as server.py
-                # inference path. Multiply by 2 to convert eFG% → points-per-shot units.
+                # Fall back to league-average zone efficiency when API returns 0
+                # (sparse sub-category or data quality gap) to prevent xPPS collapsing
+                # toward 0 and producing a spurious negative efficiency_delta.
+                d_eff  = float(d.get("DRIVE_FG_PCT",       0) or 0) or _LEAGUE_AVG_DRIVE_FG_PCT
+                pu_eff = float(pu.get("PULL_UP_EFG_PCT",   0) or 0) or _LEAGUE_AVG_PULLUP_EFG_PCT
+                cs_eff = float(c.get("CATCH_SHOOT_EFG_PCT",0) or 0) or _LEAGUE_AVG_CS_EFG_PCT
                 xPPS = 2.0 * (
                     (d_fga  / t_fga) * d_eff +
                     (pu_fga / t_fga) * pu_eff +

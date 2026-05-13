@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.21.0"  # feat: prior-season tracking archetypes — xPPS_base, real potentialAst, inactive drives/ast pools
+SERVER_VERSION = "v6.21.1"  # fix: league-avg fallback efficiencies in xPPS_base when zone FG% is 0
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1691,10 +1691,13 @@ def _build_xgb_features(
             _cs_fga = float(tracking_row.get("catchShootFga",   0) or 0)
             _t_fga  = _d_fga + _pu_fga + _cs_fga
             if _t_fga >= 1.0:
+                _d_eff  = float(tracking_row.get("driveFgPct",       0) or 0) or _LEAGUE_AVG_DRIVE_FG_PCT
+                _pu_eff = float(tracking_row.get("pullUpEfgPct",     0) or 0) or _LEAGUE_AVG_PULLUP_EFG_PCT
+                _cs_eff = float(tracking_row.get("catchShootEfgPct", 0) or 0) or _LEAGUE_AVG_CS_EFG_PCT
                 _xpps = 2.0 * (
-                    (_d_fga  / _t_fga) * float(tracking_row.get("driveFgPct",       0) or 0) +
-                    (_pu_fga / _t_fga) * float(tracking_row.get("pullUpEfgPct",     0) or 0) +
-                    (_cs_fga / _t_fga) * float(tracking_row.get("catchShootEfgPct", 0) or 0)
+                    (_d_fga  / _t_fga) * _d_eff +
+                    (_pu_fga / _t_fga) * _pu_eff +
+                    (_cs_fga / _t_fga) * _cs_eff
                 )
                 if _xpps > 0:
                     xPPS_base        = round(_xpps, 4)
