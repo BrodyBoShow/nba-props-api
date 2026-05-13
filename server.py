@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.17.1"  # Fix: tracking missing player_or_team=Player param — was returning team rows
+SERVER_VERSION = "v6.18.0"  # feat: shot-quality tracking adj for points props (drives, pull-up, catch-shoot EFG%)
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -752,6 +752,43 @@ def _build_tracking():
             "rebChancePct":   _pct(reb.get("REB_CHANCE_PCT"))  if reb else 0,
         }
 
+    # ── Shot-quality tracking (Drives, PullUpShot, CatchShoot) ───────────────
+    def _fetch_shot_tracking(measure_type):
+        for season, stype in [(SEASON, "Playoffs"), (SEASON, "Regular Season"),
+                              ("2024-25", "Playoffs"), ("2024-25", "Regular Season")]:
+            try:
+                df = leaguedashptstats.LeagueDashPtStats(
+                    season=season, season_type_all_star=stype,
+                    per_mode_simple="PerGame", pt_measure_type=measure_type,
+                    player_or_team="Player",
+                ).get_data_frames()[0]
+                _sleep()
+                if not df.empty and "PLAYER_ID" in df.columns:
+                    logging.info("%s tracking [%s %s] %d players", measure_type, season, stype, len(df))
+                    return df.set_index("PLAYER_ID").to_dict("index")
+            except Exception as e:
+                logging.warning("%s tracking [%s %s] failed: %s", measure_type, season, stype, e)
+        return {}
+
+    drives_idx   = _fetch_shot_tracking("Drives")
+    pullup_idx   = _fetch_shot_tracking("PullUpShot")
+    cs_idx       = _fetch_shot_tracking("CatchShoot")
+
+    for name, trow in tracking.items():
+        pid = trow["pid"]
+        d = drives_idx.get(pid, {})
+        p = pullup_idx.get(pid, {})
+        c = cs_idx.get(pid, {})
+        trow["driveFga"]         = _f(d.get("DRIVE_FGA",             0) or 0)
+        trow["driveFgPct"]       = _f(d.get("DRIVE_FG_PCT",          0) or 0)
+        trow["drivePts"]         = _f(d.get("DRIVE_PTS",             0) or 0)
+        trow["pullUpFga"]        = _f(p.get("PULL_UP_FGA",           0) or 0)
+        trow["pullUpEfgPct"]     = _f(p.get("PULL_UP_EFG_PCT",       0) or 0)
+        trow["pullUpPts"]        = _f(p.get("PULL_UP_PTS",           0) or 0)
+        trow["catchShootFga"]    = _f(c.get("CATCH_SHOOT_FGA",       0) or 0)
+        trow["catchShootEfgPct"] = _f(c.get("CATCH_SHOOT_EFG_PCT",   0) or 0)
+        trow["catchShootPts"]    = _f(c.get("CATCH_SHOOT_PTS",       0) or 0)
+
     logging.info("Built tracking stats for %d players", len(tracking))
     return tracking
 
@@ -986,8 +1023,12 @@ def get_matchup_delta():
 
 
 # ── Constants for correlation math ───────────────────────────────────────────
-_LEAGUE_AVG_AST_CONV   = 0.30   # baseline AST/POTENTIAL_AST
-_LEAGUE_AVG_REB_CONV   = 55.0   # % of rebound chances that convert (league avg)
+_LEAGUE_AVG_AST_CONV        = 0.30   # baseline AST/POTENTIAL_AST
+_LEAGUE_AVG_REB_CONV        = 55.0   # % of rebound chances that convert (league avg)
+_LEAGUE_AVG_DRIVE_FG_PCT    = 0.477  # FGA-weighted drive FG% (2025-26 PO)
+_LEAGUE_AVG_PULLUP_EFG_PCT  = 0.451  # FGA-weighted pull-up EFG% (2025-26 PO)
+_LEAGUE_AVG_CS_EFG_PCT      = 0.531  # FGA-weighted catch-&-shoot EFG% (2025-26 PO)
+_SHOT_QUAL_CAP              = 0.08   # ±8% max shot-quality adjustment for points
 _THREE_PT_RELY_THRESH  = 35.0   # % pts from 3s = "3pt-reliant" shooter
 _FG3_ELITE_DEF_THRESH  = -0.015 # fg3VsAvg ≤ this → elite 3pt defense
 _MATCHUP_SCALE         = 0.015  # +1.5% projection per +1.0 dEFF point increase
@@ -2242,6 +2283,44 @@ def post_project():
                     )
         breakdown["hustleAdj"] = hustle_delta
         corr = round(corr + hustle_delta, 1)
+
+        # ─────────────────────────────────────────────────────────────────────────
+        # ADJUSTMENT 4b — SHOT QUALITY (points props only)
+        # Weighted efficiency delta across three tracked shot categories:
+        #   Drives (FG%), Pull-up (EFG%), Catch-&-Shoot (EFG%)
+        # Weight = each category's FGA share of total tracked FGA.
+        # +1% efficiency edge = roughly +0.3 pts at league-avg volume.
+        # Soft-capped at ±8%.
+        # ─────────────────────────────────────────────────────────────────────────
+        shot_qual_adj = 0.0
+        if prop_type in _SCORING_PROPS and tracking_row:
+            drive_fga  = float(tracking_row.get("driveFga",         0) or 0)
+            pullup_fga = float(tracking_row.get("pullUpFga",         0) or 0)
+            cs_fga     = float(tracking_row.get("catchShootFga",     0) or 0)
+            total_fga  = drive_fga + pullup_fga + cs_fga
+            if total_fga >= 2.0:
+                drive_eff  = float(tracking_row.get("driveFgPct",        0) or 0)
+                pullup_eff = float(tracking_row.get("pullUpEfgPct",       0) or 0)
+                cs_eff     = float(tracking_row.get("catchShootEfgPct",   0) or 0)
+                eff_delta  = (
+                    (drive_eff  - _LEAGUE_AVG_DRIVE_FG_PCT)   * (drive_fga  / total_fga) +
+                    (pullup_eff - _LEAGUE_AVG_PULLUP_EFG_PCT)  * (pullup_fga / total_fga) +
+                    (cs_eff     - _LEAGUE_AVG_CS_EFG_PCT)      * (cs_fga     / total_fga)
+                )
+                shot_qual_pct = _soft_cap(eff_delta, _SHOT_QUAL_CAP)
+                shot_qual_adj = round(corr * shot_qual_pct, 2)
+                if abs(shot_qual_pct) >= 0.005:
+                    direction = "ABOVE" if eff_delta > 0 else "BELOW"
+                    drivers.append(
+                        f"Shot Quality — {resolved_name.title()} shoots "
+                        f"{abs(eff_delta)*100:.1f}% {direction} league avg "
+                        f"across drives ({drive_eff:.1%} FG%), "
+                        f"pull-ups ({pullup_eff:.1%} EFG%), "
+                        f"catch-&-shoot ({cs_eff:.1%} EFG%). "
+                        f"Impact: {shot_qual_adj:+.2f} pts."
+                    )
+        breakdown["shotQualAdj"] = shot_qual_adj
+        corr = round(corr + shot_qual_adj, 2)
 
         # ─────────────────────────────────────────────────────────────────────────
         # ADJUSTMENT 5 — PACE CONTEXT
