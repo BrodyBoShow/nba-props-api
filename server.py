@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.16.0"  # Fix: route l5_avg+ewma to correct stat slot per prop_type; unify bulk l5_stat_values
+SERVER_VERSION = "v6.17.0"  # Fix: tracking fallback to 2024-25 when current season returns empty
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -667,37 +667,29 @@ def _build_tracking():
     Passing  → POTENTIAL_AST, AST, PASSES_MADE (for AST conversion rate)
     Rebounding → OREB_CHANCE, DREB_CHANCE, REB_CHANCE_PCT (optional enrichment)
     """
-    def _fetch_passing(season_type):
-        df = leaguedashptstats.LeagueDashPtStats(
-            season=SEASON,
-            season_type_all_star=season_type,
-            per_mode_simple="PerGame",
-            pt_measure_type="Passing",
-        ).get_data_frames()[0]
-        logging.info("Passing tracking [%s] cols: %s  rows: %d",
-                     season_type, df.columns.tolist()[:8], len(df))
-        return df
-
-    def _fetch_rebounding(season_type):
-        return leaguedashptstats.LeagueDashPtStats(
-            season=SEASON,
-            season_type_all_star=season_type,
-            per_mode_simple="PerGame",
-            pt_measure_type="Rebounding",
-        ).get_data_frames()[0]
-
-    # Try PO first, fall back to RS if empty
+    # Try PO first, fall back to RS, then prior season if current season is empty
     pass_df = None
-    for stype in ("Playoffs", "Regular Season"):
+    attempts = [
+        (SEASON,   "Playoffs"),
+        (SEASON,   "Regular Season"),
+        ("2024-25", "Playoffs"),
+        ("2024-25", "Regular Season"),
+    ]
+    for season, stype in attempts:
         try:
-            df = _fetch_passing(stype)
+            df = leaguedashptstats.LeagueDashPtStats(
+                season=season,
+                season_type_all_star=stype,
+                per_mode_simple="PerGame",
+                pt_measure_type="Passing",
+            ).get_data_frames()[0]
             _sleep()
             if not df.empty and "PLAYER_ID" in df.columns:
                 pass_df = df
-                logging.info("Using %s passing tracking (%d players)", stype, len(df))
+                logging.info("Using %s %s passing tracking (%d players)", season, stype, len(df))
                 break
         except Exception as e:
-            logging.warning("Passing tracking [%s] failed: %s", stype, e)
+            logging.warning("Passing tracking [%s %s] failed: %s", season, stype, e)
 
     if pass_df is None or pass_df.empty:
         logging.warning("No passing tracking data available — tracking cache will be empty")
@@ -705,9 +697,15 @@ def _build_tracking():
 
     # ── Rebounding (optional enrichment) ─────────────────────────────────────
     reb_idx = {}
-    for stype in ("Playoffs", "Regular Season"):
+    for season, stype in [(SEASON, "Playoffs"), (SEASON, "Regular Season"),
+                          ("2024-25", "Playoffs"), ("2024-25", "Regular Season")]:
         try:
-            reb_df = _fetch_rebounding(stype)
+            reb_df = leaguedashptstats.LeagueDashPtStats(
+                season=season,
+                season_type_all_star=stype,
+                per_mode_simple="PerGame",
+                pt_measure_type="Rebounding",
+            ).get_data_frames()[0]
             _sleep()
             pid_col = next(
                 (c for c in ["PLAYER_ID", "PlayerID", "PERSONID"] if c in reb_df.columns),
@@ -715,10 +713,10 @@ def _build_tracking():
             )
             if pid_col and not reb_df.empty:
                 reb_idx = reb_df.set_index(pid_col).to_dict("index")
-                logging.info("Rebounding tracking [%s] %d players", stype, len(reb_idx))
+                logging.info("Rebounding tracking [%s %s] %d players", season, stype, len(reb_idx))
                 break
         except Exception as e:
-            logging.warning("Rebounding tracking [%s] failed: %s", stype, e)
+            logging.warning("Rebounding tracking [%s %s] failed: %s", season, stype, e)
 
     # ── Detect player ID / name columns in passing DF ──────────────────────────
     pid_col  = next((c for c in ["PLAYER_ID", "PlayerID", "PERSONID"] if c in pass_df.columns), None)
