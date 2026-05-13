@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.19.0"  # fix: shot-quality gated behind xgb — was inflating XGB predictions by +1.5-1.8 pts
+SERVER_VERSION = "v6.19.1"  # fix: shot-quality unconditional — ±1.5% cap w/ XGB, ±3% heuristic; always visible in drivers
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -1029,6 +1029,7 @@ _LEAGUE_AVG_DRIVE_FG_PCT    = 0.477  # FGA-weighted drive FG% (2025-26 PO)
 _LEAGUE_AVG_PULLUP_EFG_PCT  = 0.451  # FGA-weighted pull-up EFG% (2025-26 PO)
 _LEAGUE_AVG_CS_EFG_PCT      = 0.531  # FGA-weighted catch-&-shoot EFG% (2025-26 PO)
 _SHOT_QUAL_CAP              = 0.03   # ±3% max shot-quality adjustment for points (heuristic-only)
+_SHOT_QUAL_CAP_XGB          = 0.015  # ±1.5% cap when XGBoost is active (informational, prevents double-count)
 _THREE_PT_RELY_THRESH  = 35.0   # % pts from 3s = "3pt-reliant" shooter
 _FG3_ELITE_DEF_THRESH  = -0.015 # fg3VsAvg ≤ this → elite 3pt defense
 _MATCHUP_SCALE         = 0.015  # +1.5% projection per +1.0 dEFF point increase
@@ -2576,12 +2577,13 @@ def post_project():
                    "usageAdj","playoffFormAdj","debutAdj","defMatchAdj"):
             breakdown[_k] = 0.0
 
-    # ADJUSTMENT 4b — SHOT QUALITY (points props, only when XGBoost is NOT active)
-    # XGBoost already encodes scoring efficiency through L5/EWMA features.
-    # Shot quality only fires as supplementary calibration for players without
-    # recent game-log data (heuristic base). Cap ±3% to avoid large swings.
+    # ADJUSTMENT 4b — SHOT QUALITY (points props, unconditional)
+    # When XGBoost is active: tight ±1.5% cap — tracking provides supplementary signal
+    # not encoded in XGB features (drive/pullup/catch-shoot split efficiency).
+    # When heuristic base: full ±3% cap for stronger calibration.
+    # Always fires so tracking context appears in the drivers/analysis output.
     shot_qual_adj = 0.0
-    if not _xgb_used and prop_type in _SCORING_PROPS and tracking_row:
+    if prop_type in _SCORING_PROPS and tracking_row:
         drive_fga  = float(tracking_row.get("driveFga",         0) or 0)
         pullup_fga = float(tracking_row.get("pullUpFga",         0) or 0)
         cs_fga     = float(tracking_row.get("catchShootFga",     0) or 0)
@@ -2595,17 +2597,19 @@ def post_project():
                 (pullup_eff - _LEAGUE_AVG_PULLUP_EFG_PCT)  * (pullup_fga / total_fga) +
                 (cs_eff     - _LEAGUE_AVG_CS_EFG_PCT)      * (cs_fga     / total_fga)
             )
-            shot_qual_pct = _soft_cap(eff_delta, _SHOT_QUAL_CAP)
+            cap = _SHOT_QUAL_CAP_XGB if _xgb_used else _SHOT_QUAL_CAP
+            shot_qual_pct = _soft_cap(eff_delta, cap)
             shot_qual_adj = round(corr * shot_qual_pct, 2)
             if abs(shot_qual_pct) >= 0.005:
                 direction = "ABOVE" if eff_delta > 0 else "BELOW"
+                xgb_note = " (capped ±1.5% — XGBoost active)" if _xgb_used else ""
                 drivers.append(
-                    f"Shot Quality — {resolved_name.title()} shoots "
+                    f"Shot Quality Tracking — {resolved_name.title()} shoots "
                     f"{abs(eff_delta)*100:.1f}% {direction} league avg "
                     f"across drives ({drive_eff:.1%} FG%), "
                     f"pull-ups ({pullup_eff:.1%} EFG%), "
                     f"catch-&-shoot ({cs_eff:.1%} EFG%). "
-                    f"Impact: {shot_qual_adj:+.2f} pts."
+                    f"Impact: {shot_qual_adj:+.2f} pts{xgb_note}."
                 )
     breakdown["shotQualAdj"] = shot_qual_adj
     corr = round(corr + shot_qual_adj, 2)
