@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.26.5"  # fix: fallback to any book when primary books don't carry the market (FGM/FGA etc.)
+SERVER_VERSION = "v6.26.6"  # fix: filter phantom ESPN conditional G6/G7 slots when series already concluded
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -3763,6 +3763,15 @@ def _fetch_espn_games(date_yyyymmdd, et_label_for_today=None):
             # Series state — ESPN provides this even for conditional Game 7s
             series = comp.get("series") or {}
             series_summary = series.get("summary") or ""
+
+            # ── Filter phantom conditional games ──────────────────────────────
+            # ESPN pre-schedules G6/G7 slots. If one team already has 4 wins,
+            # the series is over and this slot was never played — skip it.
+            series_competitors = series.get("competitors") or []
+            if series_competitors:
+                wins = [int(c.get("wins") or 0) for c in series_competitors]
+                if max(wins) >= 4:
+                    continue  # series concluded — phantom game, skip
 
             # Extract game number from notes (e.g., "East 1st Round - Game 7")
             notes = comp.get("notes") or []
