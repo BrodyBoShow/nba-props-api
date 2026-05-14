@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.26.2"  # feat: SSE ready-stream endpoint — eliminates cold-start polling loop
+SERVER_VERSION = "v6.26.3"  # fix: SSE retries players build on warmup cache-miss; client proceeds on warmupDone
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -4430,23 +4430,33 @@ def ready_stream():
     """SSE endpoint — client opens one connection; server pushes ready event when warm.
     Eliminates the 20-request polling loop on cold start."""
     def generate():
+        import time as _time
         # Already warm — fire immediately
         if _cache_get("players") is not None:
             yield f"data: {json.dumps({'ready': True, 'warmupDone': True})}\n\n"
             return
-        # Send a heartbeat every 10 s so the connection stays alive through proxies,
-        # then push the real event once warmup_done fires.
-        import time as _time
-        deadline = _time.monotonic() + 330  # 5.5 min max — matches client timeout
+        # Wait for warmup, sending heartbeat comments every 10s to keep proxy alive.
+        deadline = _time.monotonic() + 330  # 5.5 min max
         while _time.monotonic() < deadline:
             done = _warmup_done.wait(timeout=10)
             players_cached = _cache_get("players") is not None
-            if done or players_cached:
-                yield f"data: {json.dumps({'ready': players_cached, 'warmupDone': True})}\n\n"
+            if players_cached:
+                yield f"data: {json.dumps({'ready': True, 'warmupDone': True})}\n\n"
                 return
-            # Heartbeat comment keeps connection alive
+            if done:
+                # Warmup thread finished but players cache is empty (build failed).
+                # Retry once inline before telling the client.
+                logging.warning("SSE: warmup done but players cache empty — retrying build")
+                try:
+                    data = _build_players()
+                    _cache_set("players", {"success": True, "players": data, "count": len(data)})
+                    yield f"data: {json.dumps({'ready': True, 'warmupDone': True})}\n\n"
+                except Exception as exc:
+                    logging.error("SSE retry build failed: %s", exc)
+                    # Tell client warmup is done but failed — it will proceed to Phase 2 anyway
+                    yield f"data: {json.dumps({'ready': False, 'warmupDone': True, 'failed': True})}\n\n"
+                return
             yield ": heartbeat\n\n"
-        # Timed out — tell client to fall back to direct fetch
         yield f"data: {json.dumps({'ready': False, 'warmupDone': False, 'timeout': True})}\n\n"
 
     return Response(
