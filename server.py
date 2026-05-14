@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.26.0"  # feat: 7 new ML interaction features — overlays, absorptions, rest flags, leverage
+SERVER_VERSION = "v6.26.1"  # fix: remove Ayo Dosunmu OUT override — cleared to play
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -86,7 +86,6 @@ _INJURY_OVERRIDES = {
     "donte divincenzo": {"status": "Out", "detail": "Right Achilles repair — out for season", "team": "NYK"},
     "luka doncic":      {"status": "Out", "detail": "Left hamstring strain — no timetable", "team": "LAL"},
     "steven adams":     {"status": "Out", "detail": "Left ankle surgery — out for season", "team": "HOU"},
-    "ayo dosunmu":      {"status": "Out", "detail": "Injury — confirmed OUT (May 2026)", "team": "MIN"},
     "joel embiid":      {"status": "Out", "detail": "Confirmed OUT — May 6 2026", "team": "PHI"},
 }
 
