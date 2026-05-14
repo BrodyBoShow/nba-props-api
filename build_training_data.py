@@ -130,7 +130,7 @@ def _fetch_scoring_season(season: str, retries: int = 3) -> pd.DataFrame:
             df = leaguedashplayerstats.LeagueDashPlayerStats(
                 season=season,
                 season_type_all_star="Regular Season",
-                per_mode_simple="PerGame",
+                per_mode_detailed="PerGame",
                 measure_type_detailed_defense="Scoring",
                 timeout=90,
             ).get_data_frames()[0]
