@@ -43,7 +43,7 @@ except ImportError:
     _ODDS_CACHE   = None
     _ODDS_AVAILABLE = False
 
-SERVER_VERSION = "v6.26.4"  # fix: unsupported odds markets return friendly 404 instead of 503
+SERVER_VERSION = "v6.26.5"  # fix: fallback to any book when primary books don't carry the market (FGM/FGA etc.)
 
 # Static TEAM_ID → abbreviation lookup (no API call needed)
 _TEAM_ID_TO_ABBR = {t["id"]: t["abbreviation"] for t in nba_teams_static.get_teams()}
@@ -2458,18 +2458,26 @@ def get_live_line(player_name, prop_key):
         return jsonify({"error": f"No line available for {prop_key.replace('_', ' ')} — enter manually"}), 404
 
     name_norm = player_name.lower().strip()
-    lines = []
-    for game in slate:
-        for book in (game.get("bookmakers") or []):
-            if book.get("key") not in _PRIMARY_BOOKS:
-                continue
-            for mkt in (book.get("markets") or []):
-                for outcome in (mkt.get("outcomes") or []):
-                    desc = (outcome.get("description") or outcome.get("name") or "").lower().strip()
-                    if desc == name_norm and outcome.get("name", "").lower() in ("over", "under"):
-                        pt = outcome.get("point")
-                        if pt is not None:
-                            lines.append(float(pt))
+
+    def _extract_lines(game_list, book_filter):
+        found = []
+        for game in game_list:
+            for book in (game.get("bookmakers") or []):
+                if book_filter and book.get("key") not in book_filter:
+                    continue
+                for mkt in (book.get("markets") or []):
+                    for outcome in (mkt.get("outcomes") or []):
+                        desc = (outcome.get("description") or outcome.get("name") or "").lower().strip()
+                        if desc == name_norm and outcome.get("name", "").lower() in ("over", "under"):
+                            pt = outcome.get("point")
+                            if pt is not None:
+                                found.append(float(pt))
+        return found
+
+    lines = _extract_lines(slate, _PRIMARY_BOOKS)
+    if not lines:
+        # Fall back to any book — some markets (FGM, FGA, etc.) aren't offered by primary books
+        lines = _extract_lines(slate, None)
 
     if not lines:
         return jsonify({"error": f"no line posted for '{player_name}'"}), 404
