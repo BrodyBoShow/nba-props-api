@@ -120,6 +120,16 @@ _XGB_PROP_MAP = {
     "pr":         None,
 }
 
+# Composite props: sum individual XGBoost component predictions.
+# Keys are ordered as they'll be summed.
+_XGB_COMPOSITE_MAP = {
+    "pra": ["pts", "reb", "ast"],
+    "pa":  ["pts", "ast"],
+    "pr":  ["pts", "reb"],
+    "ra":  ["reb", "ast"],
+}
+_COMPOSITE_PO_KEY = {"pts": "ppg", "reb": "rpg", "ast": "apg"}
+
 def _load_xgb_models():
     """Load Poisson + quantile XGBoost model files and metadata from disk."""
     global _XGB_MODELS, _XGB_QUANTILE, _XGB_META
@@ -2686,6 +2696,67 @@ def post_project():
                     breakdown["xgb_features_debug"]   = {k: (round(v, 3) if isinstance(v, float) else v) for k, v in feats.items()}
         except Exception as _xe:
             logging.warning("XGBoost inference error: %s", _xe)
+
+    # Composite XGBoost: sum component predictions for pra/pa/pr/ra.
+    # Only fires when single-prop XGBoost didn't already run and all component models are loaded.
+    if not _xgb_used:
+        _comp_keys = _XGB_COMPOSITE_MAP.get(prop_type, [])
+        if _comp_keys and all(_XGB_MODELS.get(c) for c in _comp_keys):
+            try:
+                comp_points, comp_q25s, comp_q50s, comp_q75s = [], [], [], []
+                _comp_feats_pts = {}
+                for _ck in _comp_keys:
+                    _po_key  = _COMPOSITE_PO_KEY[_ck]
+                    _cl5_avg = float(po.get(_po_key) or 0) or None
+                    _cf = _build_xgb_features(
+                        player, po, rs, scoring_row, tracking_row, opp_def,
+                        own_team_data, opp_team_data,
+                        _cl5_avg, l5_min, [], rest_days, is_home,
+                        inactive_usg_pool=_inactive_usg_pool,
+                        inactive_potential_ast_pool=_inactive_potential_ast_pool,
+                        inactive_drives_pool=_inactive_drives_pool,
+                        prop_type=_ck,
+                        high_leverage=high_leverage,
+                    )
+                    if _ck == "pts":
+                        _comp_feats_pts = _cf
+                    _cout = _xgb_predict(_ck, _cf)
+                    if _cout is None:
+                        break
+                    comp_points.append(_cout["point"])
+                    if _cout.get("q25"): comp_q25s.append(_cout["q25"])
+                    if _cout.get("q50"): comp_q50s.append(_cout["q50"])
+                    if _cout.get("q75"): comp_q75s.append(_cout["q75"])
+
+                if len(comp_points) == len(_comp_keys):
+                    _cp_sum   = sum(comp_points)
+                    _cq50_sum = sum(comp_q50s) if len(comp_q50s) == len(_comp_keys) else None
+                    _cq25_sum = sum(comp_q25s) if len(comp_q25s) == len(_comp_keys) else None
+                    _cq75_sum = sum(comp_q75s) if len(comp_q75s) == len(_comp_keys) else None
+                    xgb_pred  = round(0.5 * _cp_sum + 0.5 * _cq50_sum, 2) if _cq50_sum else round(_cp_sum, 2)
+                    xgb_q50, xgb_q25, xgb_q75 = _cq50_sum, _cq25_sum, _cq75_sum
+                    ev_vs_base = round((xgb_pred / base - 1) * 100, 1) if base else 0
+                    if base and abs(ev_vs_base) > 35:
+                        breakdown["xgb_rejected"] = True
+                        breakdown["xgb_rejection_reason"] = f"composite deviation {ev_vs_base:+.1f}% exceeds ±35% guardrail"
+                    else:
+                        corr = xgb_pred
+                        _xgb_used = True
+                        feats = _comp_feats_pts  # use pts feats for KNN (strongest signal)
+                        q_str = f" | q25={xgb_q25} q50={xgb_q50} q75={xgb_q75}" if xgb_q50 else ""
+                        drivers.append(
+                            f"XGBoost ML Base (composite) — summed {'+'.join(_comp_keys)} component models "
+                            f"({xgb_pred:.1f}{q_str}). Delta vs heuristic: {ev_vs_base:+.1f}%."
+                        )
+                        breakdown["xgb_base"]             = round(xgb_pred, 2)
+                        breakdown["xgb_vs_heuristic_pct"] = ev_vs_base
+                        breakdown["xgb_q25"]              = xgb_q25
+                        breakdown["xgb_q50"]              = xgb_q50
+                        breakdown["xgb_q75"]              = xgb_q75
+                        breakdown["xgb_composite_components"] = _comp_keys
+            except Exception as _cxe:
+                logging.warning("XGBoost composite inference error: %s", _cxe)
+
     breakdown["xgb_active"] = _xgb_used
 
     # NOTE (v1 hybrid): When XGBoost is active, Adj 1-12 still run but their
@@ -3440,7 +3511,7 @@ def post_project():
     bucket_n      = 0
     SIM_THRESHOLD = 2.5
 
-    if residual_n >= 5:   # need ≥5 total samples before any calibration fires
+    if residual_n >= 3:   # need ≥3 total samples before any calibration fires
         try:
             samples = prior_residuals[-15:]   # pool the last 15 for richer signal
 
@@ -3475,7 +3546,7 @@ def post_project():
             if weighted_errors:
                 total_w   = sum(w for _, w in weighted_errors)
                 mean_bias = sum(e * w for e, w in weighted_errors) / total_w
-                if abs(mean_bias) >= 0.04:   # 4% threshold — only act on systemic bias
+                if abs(mean_bias) >= 0.03:   # 3% threshold — catches subtler systemic bias
                     residual_pct = _soft_cap(mean_bias, 0.08)  # sigmoid, was hard ±8%
                     res_abs      = round(corr * residual_pct, 2)
                     direction    = "under" if mean_bias > 0 else "over"
